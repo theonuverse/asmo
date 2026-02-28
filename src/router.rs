@@ -3,6 +3,8 @@
 //! New fields added to [`SystemStats`] (or its nested types) are automatically
 //! exposed as endpoints without any routing changes.
 
+use std::sync::Arc;
+
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -11,7 +13,16 @@ use axum::{Json, Router};
 use serde_json::Value;
 use tokio::sync::watch;
 
-use crate::types::SystemStats;
+use crate::types::{AtomicHealth, SystemStats};
+
+// ─── State ─────────────────────────────────────────────────────────────────
+
+/// Shared application state — cloned cheaply per request via `Arc` internals.
+#[derive(Clone)]
+struct AppState {
+    stats: watch::Receiver<SystemStats>,
+    health: Arc<AtomicHealth>,
+}
 
 // ─── Router construction ───────────────────────────────────────────────────
 
@@ -23,6 +34,7 @@ use crate::types::SystemStats;
 /// |--------|-------------------------------|---------------------------------------|
 /// | `GET`  | `/`                           | API index — lists every endpoint      |
 /// | `GET`  | `/stats`                      | Full system stats snapshot            |
+/// | `GET`  | `/health`                     | Monitor health status                 |
 /// | `GET`  | `/<field>`                    | Single top-level field                |
 /// | `GET`  | `/<f1>,<f2>,…`                | Multiple fields in one request        |
 /// | `GET`  | `/cores/<name>`               | Single core by name                   |
@@ -30,20 +42,23 @@ use crate::types::SystemStats;
 /// | `GET`  | `/cores/<name>/<f1>,<f2>,…`   | Multiple core fields                  |
 /// | `GET`  | `/cores/*/<field>`            | Field from every core (wildcard)      |
 /// | `GET`  | `/cores/all/<f1>,<f2>,…`      | Multiple fields from every core       |
-pub fn build(rx: watch::Receiver<SystemStats>) -> Router {
+pub fn build(rx: watch::Receiver<SystemStats>, health: Arc<AtomicHealth>) -> Router {
+    let state = AppState { stats: rx, health };
+
     Router::new()
         .route("/", get(index))
         .route("/stats", get(stats))
+        .route("/health", get(health_check))
         .route("/*path", get(resolve))
-        .with_state(rx)
+        .with_state(state)
 }
 
 // ─── Handlers ──────────────────────────────────────────────────────────────
 
 /// `GET /` — Returns the API index with every available endpoint.
-async fn index(State(rx): State<watch::Receiver<SystemStats>>) -> Json<Value> {
-    let tree = stats_to_value(&rx.borrow());
-    let mut endpoints = vec!["/stats".to_owned()];
+async fn index(State(state): State<AppState>) -> Json<Value> {
+    let tree = stats_to_value(&state.stats.borrow());
+    let mut endpoints = vec!["/stats".to_owned(), "/health".to_owned()];
     enumerate_endpoints(&tree, "", &mut endpoints);
 
     Json(serde_json::json!({
@@ -57,8 +72,14 @@ async fn index(State(rx): State<watch::Receiver<SystemStats>>) -> Json<Value> {
 }
 
 /// `GET /stats` — Returns the full system stats snapshot.
-async fn stats(State(rx): State<watch::Receiver<SystemStats>>) -> Json<SystemStats> {
-    Json(rx.borrow().clone())
+async fn stats(State(state): State<AppState>) -> Json<SystemStats> {
+    Json(state.stats.borrow().clone())
+}
+
+/// `GET /health` — Returns the current monitor health status.
+async fn health_check(State(state): State<AppState>) -> Json<Value> {
+    let health = state.health.load();
+    Json(serde_json::json!({ "status": health }))
 }
 
 /// `GET /{path}` — Resolves an arbitrary path against the current stats.
@@ -66,10 +87,10 @@ async fn stats(State(rx): State<watch::Receiver<SystemStats>>) -> Json<SystemSta
 /// Supports comma-separated fields in the last segment and wildcards (`*` / `all`)
 /// for array expansion, e.g. `/cores/*/usage` or `/cores/all/usage,cur_freq`.
 async fn resolve(
-    State(rx): State<watch::Receiver<SystemStats>>,
+    State(state): State<AppState>,
     Path(path): Path<String>,
 ) -> Response {
-    let tree = stats_to_value(&rx.borrow());
+    let tree = stats_to_value(&state.stats.borrow());
 
     let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
 
@@ -111,12 +132,12 @@ fn clean_f32_precision(value: &mut Value) {
     match value {
         Value::Number(n) => {
             // Only touch floats — leave integers untouched.
-            if n.as_u64().is_none() && n.as_i64().is_none() {
-                if let Some(f) = n.as_f64() {
-                    if let Some(clean) = serde_json::Number::from_f64((f as f32) as f64) {
-                        *n = clean;
-                    }
-                }
+            if n.as_u64().is_none()
+                && n.as_i64().is_none()
+                && let Some(f) = n.as_f64()
+                && let Some(clean) = serde_json::Number::from_f64((f as f32) as f64)
+            {
+                *n = clean;
             }
         }
         Value::Array(arr) => arr.iter_mut().for_each(clean_f32_precision),
@@ -126,7 +147,6 @@ fn clean_f32_precision(value: &mut Value) {
 }
 
 /// Returns `true` for wildcard tokens (`*` and `all`).
-#[inline]
 fn is_wildcard(s: &str) -> bool {
     s == "*" || s == "all"
 }
@@ -156,8 +176,8 @@ fn navigate(value: &Value, segments: &[&str]) -> Option<Value> {
 ///
 /// - Single field:      `/battery_level`           → `{"battery_level": 100}`
 /// - Comma fields:      `/cpu_temp,gpu_temp`       → `{"cpu_temp": 34.4, …}`
-/// - Wildcard:          `/cores/*/usage`            → `[{"name":"cpu0","usage":…}, …]`
-/// - Wildcard + commas: `/cores/all/usage,cur_freq` → `[{"name":"cpu0","usage":…,"cur_freq":…}, …]`
+/// - Wildcard:          `/cores/*/usage`            → `[{"usage":…}, …]`
+/// - Wildcard + commas: `/cores/all/usage,cur_freq` → `[{"usage":…,"cur_freq":…}, …]`
 fn resolve_request(value: &Value, segments: &[&str]) -> Option<Value> {
     if segments.is_empty() {
         return Some(value.clone());
@@ -251,5 +271,149 @@ fn enumerate_endpoints(value: &Value, prefix: &str, out: &mut Vec<String>) {
             }
             _ => {}
         }
+    }
+}
+
+// ─── Tests ─────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clean_f32_precision_roundtrips_f32() {
+        // Values originating from f32 should survive the f32 round-trip unchanged.
+        let original = 556.8_f32;
+        let promoted = original as f64; // what serde_json does internally
+        let mut val = serde_json::json!(promoted);
+        clean_f32_precision(&mut val);
+        assert_eq!(val.as_f64().unwrap(), promoted);
+    }
+
+    #[test]
+    fn clean_f32_precision_preserves_integers() {
+        let mut val = serde_json::json!(42);
+        clean_f32_precision(&mut val);
+        assert_eq!(val, serde_json::json!(42));
+    }
+
+    #[test]
+    fn clean_f32_precision_walks_nested() {
+        let mut val = serde_json::json!({"a": [1.100000023841858, 2]});
+        clean_f32_precision(&mut val);
+        assert_eq!(val, serde_json::json!({"a": [1.100000023841858_f64 as f32 as f64, 2]}));
+    }
+
+    #[test]
+    fn wildcard_detection() {
+        assert!(is_wildcard("*"));
+        assert!(is_wildcard("all"));
+        assert!(!is_wildcard("cpu0"));
+        assert!(!is_wildcard(""));
+    }
+
+    #[test]
+    fn resolve_single_field() {
+        let tree = serde_json::json!({"battery_level": 85, "cpu_temp": 42.0});
+        let result = resolve_request(&tree, &["battery_level"]);
+        assert_eq!(result, Some(serde_json::json!({"battery_level": 85})));
+    }
+
+    #[test]
+    fn resolve_comma_fields_extracts_multiple() {
+        let tree = serde_json::json!({"a": 1, "b": 2, "c": 3});
+        let result = resolve_comma_fields(&tree, "a,c");
+        assert_eq!(result, Some(serde_json::json!({"a": 1, "c": 3})));
+    }
+
+    #[test]
+    fn resolve_comma_fields_none_for_missing() {
+        let tree = serde_json::json!({"a": 1});
+        assert_eq!(resolve_comma_fields(&tree, "x,y"), None);
+    }
+
+    #[test]
+    fn resolve_not_found_returns_none() {
+        let tree = serde_json::json!({"a": 1});
+        assert_eq!(resolve_request(&tree, &["nonexistent"]), None);
+    }
+
+    #[test]
+    fn resolve_wildcard_collects_field() {
+        let tree = serde_json::json!({
+            "cores": [
+                {"name": "cpu0", "usage": 10.0},
+                {"name": "cpu1", "usage": 20.0}
+            ]
+        });
+        let result = resolve_request(&tree, &["cores", "*", "usage"]).unwrap();
+        assert!(result.is_array());
+        assert_eq!(
+            result,
+            serde_json::json!([{"usage": 10.0}, {"usage": 20.0}])
+        );
+    }
+
+    #[test]
+    fn resolve_wildcard_all_items() {
+        let tree = serde_json::json!({
+            "items": [
+                {"name": "a", "val": 1},
+                {"name": "b", "val": 2}
+            ]
+        });
+        let result = resolve_request(&tree, &["items", "all"]).unwrap();
+        assert!(result.is_array());
+        assert_eq!(result.as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn navigate_nested_path() {
+        let tree = serde_json::json!({"a": {"b": {"c": 42}}});
+        assert_eq!(navigate(&tree, &["a", "b", "c"]), Some(serde_json::json!(42)));
+    }
+
+    #[test]
+    fn navigate_array_by_name() {
+        let tree = serde_json::json!([
+            {"name": "cpu0", "usage": 10.0},
+            {"name": "cpu1", "usage": 20.0}
+        ]);
+        let result = navigate(&tree, &["cpu1", "usage"]);
+        assert_eq!(result, Some(serde_json::json!(20.0)));
+    }
+
+    #[test]
+    fn enumerate_endpoints_discovers_all() {
+        let tree = serde_json::json!({
+            "battery_level": 100,
+            "cpu_temp": 42.0,
+        });
+        let mut out = vec![];
+        enumerate_endpoints(&tree, "", &mut out);
+        assert!(out.contains(&"/battery_level".to_owned()));
+        assert!(out.contains(&"/cpu_temp".to_owned()));
+        assert_eq!(out.len(), 2);
+    }
+
+    #[test]
+    fn enumerate_endpoints_with_array() {
+        let tree = serde_json::json!({
+            "cores": [
+                {"name": "cpu0", "usage": 10.0},
+            ]
+        });
+        let mut out = vec![];
+        enumerate_endpoints(&tree, "", &mut out);
+        assert!(out.contains(&"/cores".to_owned()));
+        assert!(out.contains(&"/cores/cpu0".to_owned()));
+        assert!(out.contains(&"/cores/cpu0/usage".to_owned()));
+    }
+
+    #[test]
+    fn resolve_handles_null_sensor_values() {
+        let tree = serde_json::json!({"cpu_temp": null, "battery_level": 85});
+        let result = resolve_request(&tree, &["cpu_temp"]);
+        assert_eq!(result, Some(serde_json::json!({"cpu_temp": null})));
     }
 }

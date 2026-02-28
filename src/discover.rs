@@ -2,29 +2,58 @@ use std::fs;
 use std::process::Command;
 use std::sync::Arc;
 
-use crate::types::{DevicePaths, StaticCoreInfo, StaticDeviceInfo};
+use tracing::{info, warn};
+
+use crate::types::{DevicePaths, DeviceStrings, StaticCoreInfo, StaticDeviceInfo};
+
+// ---------------------------------------------------------------------------
+// Discovery-local structs — replace anonymous tuples with named fields.
+// ---------------------------------------------------------------------------
+
+struct ThermalProbe {
+    cpu_temp_path: String,
+    gpu_temp_path: String,
+    core_count: usize,
+}
+
+struct DeviceIdentity {
+    manufacturer: String,
+    product_model: String,
+    soc_model: String,
+}
 
 // ---------------------------------------------------------------------------
 // One-shot device discovery — runs at startup, never again.
 // ---------------------------------------------------------------------------
 
 pub fn discover_device_layout() -> (DevicePaths, StaticDeviceInfo) {
-    let (cpu_temp, gpu_temp, core_count) = probe_thermal_and_cores();
-    let (manufacturer, product_model, soc_model) = probe_device_props();
+    let thermal = probe_thermal_and_cores();
+    let identity = probe_device_props();
     let (kernel_version, android_version) = probe_system_versions();
-    let cores = probe_core_info(core_count);
+    let cores = probe_core_info(thermal.core_count);
+
+    info!(
+        cores = cores.len(),
+        cpu_thermal = %thermal.cpu_temp_path,
+        gpu_thermal = %thermal.gpu_temp_path,
+        "device discovery complete"
+    );
 
     let paths = DevicePaths {
-        cpu_temp: cpu_temp.into_boxed_str(),
-        gpu_temp: gpu_temp.into_boxed_str(),
+        cpu_temp: thermal.cpu_temp_path.into_boxed_str(),
+        gpu_temp: thermal.gpu_temp_path.into_boxed_str(),
     };
 
-    let static_info = StaticDeviceInfo {
-        manufacturer: Arc::from(manufacturer),
-        product_model: Arc::from(product_model),
-        soc_model: Arc::from(soc_model),
+    let device = Arc::new(DeviceStrings {
+        manufacturer: Arc::from(identity.manufacturer),
+        product_model: Arc::from(identity.product_model),
+        soc_model: Arc::from(identity.soc_model),
         kernel_version: Arc::from(kernel_version),
         android_version: Arc::from(android_version),
+    });
+
+    let static_info = StaticDeviceInfo {
+        device,
         cores: cores.into_boxed_slice(),
     };
 
@@ -36,10 +65,12 @@ pub fn discover_device_layout() -> (DevicePaths, StaticDeviceInfo) {
 // ---------------------------------------------------------------------------
 
 /// Probe sysfs thermal zones and CPU topology directly (no `rish` needed).
-fn probe_thermal_and_cores() -> (String, String, usize) {
-    let mut cpu_temp = "/sys/class/thermal/thermal_zone0/temp".to_owned();
-    let mut gpu_temp = "/sys/class/thermal/thermal_zone1/temp".to_owned();
-    let mut core_count = 0_usize;
+fn probe_thermal_and_cores() -> ThermalProbe {
+    let mut result = ThermalProbe {
+        cpu_temp_path: "/sys/class/thermal/thermal_zone0/temp".to_owned(),
+        gpu_temp_path: "/sys/class/thermal/thermal_zone1/temp".to_owned(),
+        core_count: 0,
+    };
 
     // Scan thermal zones directly from sysfs.
     if let Ok(entries) = fs::read_dir("/sys/class/thermal") {
@@ -56,18 +87,16 @@ fn probe_thermal_and_cores() -> (String, String, usize) {
             let temp_path = entry.path().join("temp").to_string_lossy().into_owned();
 
             if lower.contains("cpuss-0") || lower.contains("aoss-0") {
-                cpu_temp = temp_path;
+                result.cpu_temp_path = temp_path;
             } else if lower.contains("gpuss-0") {
-                gpu_temp = temp_path;
+                result.gpu_temp_path = temp_path;
             }
         }
     }
 
     // Count CPU cores directly from sysfs.
-    // The glob `/cpu[0-9]*` matches cpu0, cpu1, …, cpu10, cpu99, etc.
-    // The [0-9] prefix filters out non-core dirs like cpufreq and cpuidle.
     if let Ok(entries) = fs::read_dir("/sys/devices/system/cpu") {
-        core_count = entries
+        result.core_count = entries
             .filter_map(Result::ok)
             .filter(|e| {
                 let name = e.file_name();
@@ -78,11 +107,11 @@ fn probe_thermal_and_cores() -> (String, String, usize) {
             .count();
     }
 
-    (cpu_temp, gpu_temp, core_count)
+    result
 }
 
 /// Read device identity via Android `getprop`.
-fn probe_device_props() -> (String, String, String) {
+fn probe_device_props() -> DeviceIdentity {
     let get = |key| -> String {
         Command::new("getprop")
             .arg(key)
@@ -92,11 +121,11 @@ fn probe_device_props() -> (String, String, String) {
             .unwrap_or_default()
     };
 
-    (
-        get("ro.product.manufacturer"),
-        get("ro.product.model"),
-        get("ro.soc.model"),
-    )
+    DeviceIdentity {
+        manufacturer: get("ro.product.manufacturer"),
+        product_model: get("ro.product.model"),
+        soc_model: get("ro.soc.model"),
+    }
 }
 
 /// Read kernel and Android version (static, called once at startup).
@@ -120,12 +149,26 @@ fn probe_system_versions() -> (String, String) {
 
 /// Gather static per-core info from `lscpu`.
 fn probe_core_info(hint: usize) -> Vec<StaticCoreInfo> {
-    let output = Command::new("lscpu")
+    let output = match Command::new("lscpu")
         .args(["-e=cpu,modelname,minmhz,maxmhz"])
         .output()
-        .expect("lscpu failed");
+    {
+        Ok(o) => o,
+        Err(e) => {
+            warn!(%e, "lscpu not available — core info will be incomplete");
+            return Vec::new();
+        }
+    };
 
     let raw = String::from_utf8_lossy(&output.stdout);
+    parse_lscpu_output(&raw, hint)
+}
+
+/// Parse raw `lscpu -e` output into core info entries.
+///
+/// Extracted from [`probe_core_info`] so the parser can be unit-tested
+/// independently of whether `lscpu` is installed.
+fn parse_lscpu_output(raw: &str, hint: usize) -> Vec<StaticCoreInfo> {
     let mut cores = Vec::with_capacity(hint);
 
     for line in raw.lines().skip(1) {
@@ -141,7 +184,7 @@ fn probe_core_info(hint: usize) -> Vec<StaticCoreInfo> {
         let max_freq: f32 = rest[rest.len() - 1].parse().unwrap_or(0.0);
 
         cores.push(StaticCoreInfo {
-            name: Arc::from(format!("cpu{}", cpu_str).as_str()),
+            name: Arc::from(format!("cpu{cpu_str}").as_str()),
             model_name: Arc::from(model_name.as_str()),
             min_freq,
             max_freq,
@@ -154,4 +197,61 @@ fn probe_core_info(hint: usize) -> Vec<StaticCoreInfo> {
     });
 
     cores
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_lscpu_output_normal() {
+        let raw = "\
+CPU MODELNAME MINMHZ MAXMHZ
+0 Cortex-A55 300.0 1804.0
+1 Cortex-A55 300.0 1804.0
+4 Cortex-A78 710.0 2400.0";
+
+        let cores = parse_lscpu_output(raw, 3);
+        assert_eq!(cores.len(), 3);
+        assert_eq!(&*cores[0].name, "cpu0");
+        assert_eq!(&*cores[1].name, "cpu1");
+        assert_eq!(&*cores[2].name, "cpu4");
+        assert_eq!(cores[0].min_freq, 300.0);
+        assert_eq!(cores[2].max_freq, 2400.0);
+    }
+
+    #[test]
+    fn parse_lscpu_output_empty() {
+        let cores = parse_lscpu_output("CPU MODELNAME MINMHZ MAXMHZ\n", 0);
+        assert!(cores.is_empty());
+    }
+
+    #[test]
+    fn parse_lscpu_output_multiword_model() {
+        let raw = "\
+CPU MODELNAME MINMHZ MAXMHZ
+0 ARM Cortex-A55 rev 1 300.0 1804.0";
+
+        let cores = parse_lscpu_output(raw, 1);
+        assert_eq!(cores.len(), 1);
+        assert_eq!(&*cores[0].model_name, "ARM Cortex-A55 rev 1");
+    }
+
+    #[test]
+    fn parse_lscpu_output_sorts_by_core_number() {
+        let raw = "\
+CPU MODELNAME MINMHZ MAXMHZ
+7 Big 710.0 2400.0
+0 Little 300.0 1804.0
+3 Little 300.0 1804.0";
+
+        let cores = parse_lscpu_output(raw, 3);
+        assert_eq!(&*cores[0].name, "cpu0");
+        assert_eq!(&*cores[1].name, "cpu3");
+        assert_eq!(&*cores[2].name, "cpu7");
+    }
 }
