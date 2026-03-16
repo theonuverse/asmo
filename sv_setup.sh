@@ -10,6 +10,7 @@ SV_DIR="$PREFIX/etc/sv/asmo"
 LOG_DIR="$PREFIX/var/log/asmo"
 SERVICE_LINK="$PREFIX/var/service/asmo"
 MAX_REGISTER_WAIT=20
+MAX_START_RETRIES=25
 
 echo ""
 echo "=== asmo v0.5.0 service setup ==="
@@ -68,17 +69,24 @@ if ! pgrep -x runsvdir >/dev/null 2>&1; then
     if [ -f "$PREFIX/etc/profile.d/start-services.sh" ]; then
         echo "  starting runsvdir for this session..."
         . "$PREFIX/etc/profile.d/start-services.sh" || true
-        sleep 1
+        sleep 2
     fi
 fi
 
 echo "[4/6] Writing service files..."
-# Re-create service directory from scratch to avoid stale supervise state
-# when running this script repeatedly.
-rm -rf "$SV_DIR"
+# Clean old registration first (important when script is rerun many times).
+sv down asmo >/dev/null 2>&1 || true
+if command -v sv-disable >/dev/null 2>&1; then
+    sv-disable asmo >/dev/null 2>&1 || true
+fi
+rm -f "$SERVICE_LINK"
+sleep 1
+
+# Keep the service directory but remove stale supervise state.
 mkdir -p "$SV_DIR/log"
 mkdir -p "$LOG_DIR"
 mkdir -p "$PREFIX/var/service"
+rm -rf "$SV_DIR/supervise" "$SV_DIR/log/supervise"
 
 # rish expects a tty in practice on many devices.
 # Keep execution wrapped in `script -q -c` to allocate a pseudo-tty.
@@ -123,12 +131,7 @@ while [ ! -S "$SV_DIR/supervise/ok" ] && [ $count -lt $MAX_REGISTER_WAIT ]; do
 done
 
 if [ ! -S "$SV_DIR/supervise/ok" ]; then
-    echo "ERROR: service did not register within ${MAX_REGISTER_WAIT}s"
-    echo "Debug checks:"
-    echo "  ps -ef | grep runsvdir"
-    echo "  ls -ld $SV_DIR"
-    echo "  ls -la $SV_DIR"
-    exit 1
+    echo "  warning: supervise/ok not ready after ${MAX_REGISTER_WAIT}s; trying sv up retries"
 fi
 
 count=0
@@ -137,18 +140,37 @@ while [ ! -S "$SV_DIR/log/supervise/ok" ] && [ $count -lt $MAX_REGISTER_WAIT ]; 
     count=$((count + 1))
 done
 
+if [ ! -S "$SV_DIR/log/supervise/ok" ]; then
+    echo "  warning: log supervise/ok not ready after ${MAX_REGISTER_WAIT}s; continuing"
+fi
+
 echo "[6/6] Starting service with sv up..."
 # Reset then start for consistent behavior across reruns.
 sv down asmo >/dev/null 2>&1 || true
 sleep 1
-sv up asmo || {
+started=0
+retry=0
+while [ $retry -lt $MAX_START_RETRIES ]; do
+    if sv up asmo >/dev/null 2>&1; then
+        started=1
+        break
+    fi
+    retry=$((retry + 1))
+    sleep 1
+done
+
+if [ $started -ne 1 ]; then
     echo ""
-    echo "ERROR: sv up asmo failed. Debug steps:"
+    echo "ERROR: sv up asmo failed after ${MAX_START_RETRIES} retries."
+    echo "Debug steps:"
     echo "  sv status asmo"
+    echo "  ps -ef | grep runsvdir"
+    echo "  ps -ef | grep runsv"
     echo "  ls -l $PREFIX/var/service"
+    echo "  ls -la $SV_DIR"
     echo "  tail -50 $LOG_DIR/current"
     exit 1
-}
+fi
 
 echo ""
 echo "=== Service setup complete ==="
