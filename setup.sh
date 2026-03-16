@@ -67,7 +67,11 @@ chmod +x "$SV_DIR/run"
 chmod +x "$SV_DIR/log/run"
 
 echo "[4/5] Enabling service with sv-enable..."
-sv-enable asmo
+# On some Termux setups sv-enable prints a transient sv error even though
+# the enable link is created correctly. Continue and validate via symlink.
+if ! sv-enable asmo; then
+    echo "  warning: sv-enable returned non-zero; validating service link..."
+fi
 
 if [ ! -e "$SERVICE_LINK" ]; then
     echo "ERROR: sv-enable did not create $SERVICE_LINK"
@@ -79,6 +83,10 @@ fi
 
 echo "[5/5] Starting service with sv up..."
 sv up asmo || {
+    echo "  first sv up failed, retrying once in 1s..."
+    sleep 1
+    sv up asmo
+} || {
     echo ""
     echo "ERROR: sv up asmo failed. Debug steps:"
     echo "  sv status asmo"
