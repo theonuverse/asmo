@@ -1,77 +1,63 @@
 #!/data/data/com.termux/files/usr/bin/sh
-# asmo setup script for Termux
-# https://github.com/theonuverse/asmo
+# asmo service setup script for Termux
+# Run this from the project directory AFTER:
+# 1) cargo build --release
+# 2) cp target/release/asmo $PREFIX/bin/asmo
 
 set -e
 
-REPO="https://github.com/theonuverse/asmo.git"
 BIN="$PREFIX/bin/asmo"
 SV_DIR="$PREFIX/etc/sv/asmo"
 LOG_DIR="$PREFIX/var/log/asmo"
+SERVICE_LINK="$PREFIX/var/service/asmo"
 
 echo ""
-echo "=== asmo v0.5.0 setup ==="
+echo "=== asmo v0.5.0 service setup ==="
 echo ""
 
-# ── 1. Update packages & install prerequisites ───────────────────────────────
+echo "[1/5] Validating current directory and build artifacts..."
+if [ ! -f "Cargo.toml" ] || [ ! -d "src" ]; then
+    echo "ERROR: run setup.sh from the asmo project root."
+    echo "Current directory: $PWD"
+    exit 1
+fi
 
-echo "[1/7] Updating package index..."
-pkg update -y
+if [ ! -x "$BIN" ]; then
+    echo "ERROR: $BIN not found or not executable."
+    echo "Build and install first:"
+    echo "  cargo build --release"
+    echo "  cp target/release/asmo \$PREFIX/bin/asmo"
+    exit 1
+fi
 
-echo "[2/7] Installing build dependencies..."
-pkg install -y git rust
-
-echo "[3/7] Checking for termux-services..."
+echo "[2/5] Checking termux-services tooling..."
 if ! command -v sv >/dev/null 2>&1; then
-    echo ""
-    echo "  termux-services is not installed — installing now."
+    echo "termux-services not found. Installing..."
     pkg install -y termux-services
     echo ""
-    echo "  IMPORTANT: termux-services requires closing and reopening Termux"
-    echo "  to become fully active. Please do that now, then re-run this script."
-    echo ""
+    echo "Close and reopen Termux once, then re-run setup.sh."
     exit 0
 fi
+if ! command -v sv-enable >/dev/null 2>&1; then
+    echo "ERROR: sv-enable not available. Ensure termux-services is fully initialized."
+    echo "Try reopening Termux and running again."
+    exit 1
+fi
 echo "  found: $(command -v sv)"
+echo "  found: $(command -v sv-enable)"
 
-# ── 2. Clone and build ───────────────────────────────────────────────────────
-
-echo "[4/7] Cloning asmo..."
-cd ~
-rm -rf ~/asmo
-git clone "$REPO" asmo
-cd asmo
-
-echo "[5/7] Building release binary (first build takes a few minutes)..."
-cargo build --release
-
-echo "[6/7] Installing binary..."
-cp target/release/asmo "$BIN"
-chmod +x "$BIN"
-echo "  installed: $BIN"
-
-# ── 3. Configure the runit service ──────────────────────────────────────────
-
-echo "[7/7] Configuring asmo service..."
+echo "[3/5] Writing service files..."
 mkdir -p "$SV_DIR/log"
 mkdir -p "$LOG_DIR"
+mkdir -p "$PREFIX/var/service"
 
-# Service run script.
-# Direct exec (no shell wrapper) so runit supervises the real process and
-# the full process tree is cleanly managed on stop/restart.
-# Stderr is merged into stdout so everything flows through the log pipeline.
-# Set RUST_LOG to adjust verbosity: info (default), debug (verbose), warn (quiet).
+# rish expects a tty in practice on many devices.
+# Keep execution wrapped in `script -q -c` to allocate a pseudo-tty.
 cat > "$SV_DIR/run" << 'RUNEOF'
 #!/data/data/com.termux/files/usr/bin/sh
-# Merge stderr into stdout so all output reaches the log pipeline.
-exec 2>&1
-# Uncomment the next line for verbose debug logging:
-# export RUST_LOG=debug
-exec asmo
+exec script -q -c "asmo" /dev/null 2>&1
 RUNEOF
 
-# Log script: svlogd rotates logs with timestamps under $LOG_DIR.
-# The -tt flag prefixes each line with a human-readable timestamp.
 cat > "$SV_DIR/log/run" << LOGEOF
 #!/data/data/com.termux/files/usr/bin/sh
 exec svlogd -tt $LOG_DIR
@@ -80,41 +66,45 @@ LOGEOF
 chmod +x "$SV_DIR/run"
 chmod +x "$SV_DIR/log/run"
 
-# Register the service so it starts automatically on every Termux session.
-# sv-enable creates the supervised symlink under $PREFIX/var/service/.
+echo "[4/5] Enabling service with sv-enable..."
 sv-enable asmo
 
-# Start the service immediately — no need to wait for runsvdir's next scan.
-sv up asmo
+if [ ! -e "$SERVICE_LINK" ]; then
+    echo "ERROR: sv-enable did not create $SERVICE_LINK"
+    echo "This usually means termux-services is not fully initialized yet."
+    echo "Close and reopen Termux, then run:"
+    echo "  ./setup.sh"
+    exit 1
+fi
 
-# ── 4. Summary and next-step guidance ────────────────────────────────────────
+echo "[5/5] Starting service with sv up..."
+sv up asmo || {
+    echo ""
+    echo "ERROR: sv up asmo failed. Debug steps:"
+    echo "  sv status asmo"
+    echo "  ls -l $PREFIX/var/service"
+    echo "  tail -50 $LOG_DIR/current"
+    exit 1
+}
 
 echo ""
-echo "=== Setup complete ==="
+echo "=== Service setup complete ==="
 echo ""
-echo "  Current service state:"
+echo "  Current state:"
 sv status asmo || true
 echo ""
 echo "  Service commands:"
-echo "    sv status asmo              show current state (run / down / finish)"
-echo "    sv up asmo                  start the service"
-echo "    sv down asmo                stop the service"
-echo "    sv restart asmo             graceful stop + restart"
-echo "    sv-enable asmo              enable auto-start on session open (already done)"
-echo "    sv-disable asmo             remove from auto-start"
-echo ""
-echo "  Viewing logs:"
-echo "    tail -f $LOG_DIR/current    follow live output"
-echo "    tail -50 $LOG_DIR/current   last 50 lines"
-echo ""
-echo "  API checks:"
-echo "    curl -s localhost:3000/health | jq .     monitor health"
-echo "    curl -s localhost:3000/debug  | jq .     deep diagnostics"
-echo ""
-echo "  To enable verbose debug logging, edit the run script:"
-echo "    nano $SV_DIR/run"
-echo "    # Uncomment the 'export RUST_LOG=debug' line, then:"
+echo "    sv status asmo"
+echo "    sv up asmo"
+echo "    sv down asmo"
 echo "    sv restart asmo"
+echo "    sv-enable asmo"
+echo "    sv-disable asmo"
 echo ""
-echo "  See README section 'Termux Service Management' for full details."
+echo "  Logs:"
+echo "    tail -f $LOG_DIR/current"
+echo ""
+echo "  API debug:"
+echo "    curl -s localhost:3000/health | jq ."
+echo "    curl -s localhost:3000/debug  | jq ."
 echo ""

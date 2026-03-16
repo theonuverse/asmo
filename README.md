@@ -251,15 +251,24 @@ cp target/release/asmo $PREFIX/bin/
 
 ## Running as a Termux service
 
-The included `setup.sh` handles everything — it builds asmo, installs the binary, and registers and starts it as a supervised runit service via [termux-services](https://wiki.termux.com/wiki/Termux-services).
+The included `setup.sh` is intentionally service-only. It does **not** clone, build, or install dependencies.
+
+Use it after you already built and installed asmo:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/theonuverse/asmo/main/setup.sh | sh
+# from the project directory
+cargo build --release
+cp target/release/asmo $PREFIX/bin/asmo
+
+# then configure runit service
+./setup.sh
 ```
 
-> **Prerequisites:** [Shizuku](https://shizuku.rikka.app/) must be running. `termux-services` will be installed automatically if missing — you will then be asked to restart Termux once and re-run the script.
+`setup.sh` creates the runit files under `$PREFIX/etc/sv/asmo`, enables the service with `sv-enable asmo`, and starts it with `sv up asmo`.
 
-Once done, asmo starts automatically on every Termux session.
+> **Prerequisites:** [Shizuku](https://shizuku.rikka.app/) must be running. `termux-services` must be available (the script installs it if missing and asks for one Termux restart).
+
+The service runner uses `exec script -q -c "asmo" /dev/null 2>&1` so `rish` has a tty.
 
 ## Termux service management
 
@@ -316,9 +325,7 @@ The script looks like this — uncomment the `RUST_LOG=debug` line:
 
 ```sh
 #!/data/data/com.termux/files/usr/bin/sh
-exec 2>&1
-# export RUST_LOG=debug   ← uncomment for verbose mode (debug, info, warn, error)
-exec asmo
+exec script -q -c "RUST_LOG=debug asmo" /dev/null 2>&1
 ```
 
 Then restart:
@@ -348,8 +355,7 @@ nano $PREFIX/etc/sv/asmo/run
 
 ```sh
 #!/data/data/com.termux/files/usr/bin/sh
-exec 2>&1
-exec asmo --port 8080 --bind 127.0.0.1 --interval 200
+exec script -q -c "asmo --port 8080 --bind 127.0.0.1 --interval 200" /dev/null 2>&1
 ```
 
 ```sh
@@ -566,7 +572,13 @@ tail -20 $PREFIX/var/log/asmo/current
 asmo
 ```
 
-If `asmo: command not found`, the binary was not installed to `$PREFIX/bin/`. Re-run `setup.sh`.
+If `asmo: command not found`, the binary was not installed to `$PREFIX/bin/`. Re-run:
+
+```sh
+cargo build --release
+cp target/release/asmo $PREFIX/bin/asmo
+./setup.sh
+```
 
 #### `rish` won’t connect / monitor health is `degraded`
 
