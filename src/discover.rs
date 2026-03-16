@@ -2,7 +2,7 @@ use std::fs;
 use std::process::Command;
 use std::sync::Arc;
 
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::types::{DevicePaths, DeviceStrings, StaticCoreInfo, StaticDeviceInfo};
 
@@ -27,15 +27,29 @@ struct DeviceIdentity {
 // ---------------------------------------------------------------------------
 
 pub fn discover_device_layout() -> (DevicePaths, StaticDeviceInfo) {
+    info!("starting device discovery");
     let thermal = probe_thermal_and_cores();
     let identity = probe_device_props();
     let (kernel_version, android_version) = probe_system_versions();
     let cores = probe_core_info(thermal.core_count);
 
+    // Check once at startup whether the selected thermal paths are readable.
+    // This surfaces sysfs permission or path-miss issues immediately in logs
+    // rather than after the first poll tick.
+    let cpu_temp_readable = std::fs::read_to_string(&thermal.cpu_temp_path).is_ok();
+    let gpu_temp_readable = std::fs::read_to_string(&thermal.gpu_temp_path).is_ok();
+
     info!(
+        manufacturer = %identity.manufacturer,
+        model = %identity.product_model,
+        soc = %identity.soc_model,
+        android = %android_version,
+        kernel = %kernel_version,
         cores = cores.len(),
         cpu_thermal = %thermal.cpu_temp_path,
+        cpu_thermal_ok = cpu_temp_readable,
         gpu_thermal = %thermal.gpu_temp_path,
+        gpu_thermal_ok = gpu_temp_readable,
         "device discovery complete"
     );
 
@@ -73,12 +87,17 @@ fn probe_thermal_and_cores() -> ThermalProbe {
     };
 
     // Scan thermal zones directly from sysfs.
+    let mut cpu_matched = false;
+    let mut gpu_matched = false;
+
     if let Ok(entries) = fs::read_dir("/sys/class/thermal") {
         let mut zones: Vec<_> = entries
             .filter_map(Result::ok)
             .filter(|e| e.file_name().to_string_lossy().starts_with("thermal_zone"))
             .collect();
         zones.sort_by_key(|e| e.file_name());
+
+        debug!(count = zones.len(), "scanning thermal zones");
 
         for entry in zones {
             let type_path = entry.path().join("type");
@@ -87,11 +106,30 @@ fn probe_thermal_and_cores() -> ThermalProbe {
             let temp_path = entry.path().join("temp").to_string_lossy().into_owned();
 
             if lower.contains("cpuss-0") || lower.contains("aoss-0") {
+                debug!(path = %temp_path, zone_type = %lower, "cpu thermal zone matched");
                 result.cpu_temp_path = temp_path;
+                cpu_matched = true;
             } else if lower.contains("gpuss-0") {
+                debug!(path = %temp_path, zone_type = %lower, "gpu thermal zone matched");
                 result.gpu_temp_path = temp_path;
+                gpu_matched = true;
             }
         }
+    } else {
+        debug!("could not read /sys/class/thermal — using default thermal paths");
+    }
+
+    if !cpu_matched {
+        debug!(
+            path = %result.cpu_temp_path,
+            "no cpu thermal zone matched cpuss-0/aoss-0 — using default fallback (thermal_zone0)"
+        );
+    }
+    if !gpu_matched {
+        debug!(
+            path = %result.gpu_temp_path,
+            "no gpu thermal zone matched gpuss-0 — using default fallback (thermal_zone1)"
+        );
     }
 
     // Count CPU cores directly from sysfs.
@@ -112,13 +150,23 @@ fn probe_thermal_and_cores() -> ThermalProbe {
 
 /// Read device identity via Android `getprop`.
 fn probe_device_props() -> DeviceIdentity {
-    let get = |key| -> String {
+    let get = |key: &str| -> String {
         Command::new("getprop")
             .arg(key)
             .output()
-            .ok()
-            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
-            .unwrap_or_default()
+            .map(|o| {
+                let v = String::from_utf8_lossy(&o.stdout).trim().to_owned();
+                if v.is_empty() {
+                    debug!(key = key, "getprop returned empty string");
+                } else {
+                    debug!(key = key, value = %v, "getprop");
+                }
+                v
+            })
+            .unwrap_or_else(|e| {
+                debug!(key = key, error = %e, "getprop command not available");
+                String::new()
+            })
     };
 
     DeviceIdentity {
@@ -143,6 +191,8 @@ fn probe_system_versions() -> (String, String) {
         .ok()
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
         .unwrap_or_default();
+
+    debug!(kernel = %kernel_version, android = %android_version, "system versions probed");
 
     (kernel_version, android_version)
 }

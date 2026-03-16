@@ -4,6 +4,8 @@
 //! exposed as endpoints without any routing changes.
 
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -12,8 +14,9 @@ use axum::routing::get;
 use axum::{Json, Router};
 use serde_json::Value;
 use tokio::sync::watch;
+use tracing::debug;
 
-use crate::types::{AtomicHealth, SystemStats};
+use crate::types::{AtomicHealth, ServiceStatus, SystemStats};
 
 // ─── State ─────────────────────────────────────────────────────────────────
 
@@ -22,6 +25,7 @@ use crate::types::{AtomicHealth, SystemStats};
 struct AppState {
     stats: watch::Receiver<SystemStats>,
     health: Arc<AtomicHealth>,
+    svc_status: Arc<ServiceStatus>,
 }
 
 // ─── Router construction ───────────────────────────────────────────────────
@@ -35,6 +39,7 @@ struct AppState {
 /// | `GET`  | `/`                           | API index — lists every endpoint      |
 /// | `GET`  | `/stats`                      | Full system stats snapshot            |
 /// | `GET`  | `/health`                     | Monitor health status                 |
+/// | `GET`  | `/debug`                      | Deep service diagnostics              |
 /// | `GET`  | `/<field>`                    | Single top-level field                |
 /// | `GET`  | `/<f1>,<f2>,…`                | Multiple fields in one request        |
 /// | `GET`  | `/cores/<name>`               | Single core by name                   |
@@ -42,13 +47,14 @@ struct AppState {
 /// | `GET`  | `/cores/<name>/<f1>,<f2>,…`   | Multiple core fields                  |
 /// | `GET`  | `/cores/*/<field>`            | Field from every core (wildcard)      |
 /// | `GET`  | `/cores/all/<f1>,<f2>,…`      | Multiple fields from every core       |
-pub fn build(rx: watch::Receiver<SystemStats>, health: Arc<AtomicHealth>) -> Router {
-    let state = AppState { stats: rx, health };
+pub fn build(rx: watch::Receiver<SystemStats>, health: Arc<AtomicHealth>, svc_status: Arc<ServiceStatus>) -> Router {
+    let state = AppState { stats: rx, health, svc_status };
 
     Router::new()
         .route("/", get(index))
         .route("/stats", get(stats))
         .route("/health", get(health_check))
+        .route("/debug", get(debug_status))
         .route("/*path", get(resolve))
         .with_state(state)
 }
@@ -82,6 +88,48 @@ async fn health_check(State(state): State<AppState>) -> Json<Value> {
     Json(serde_json::json!({ "status": health }))
 }
 
+/// `GET /debug` — Deep service diagnostics: runtime counters, monitor state,
+/// sysfs probe results, and configuration. Useful for troubleshooting without
+/// needing to tail raw logs.
+async fn debug_status(State(state): State<AppState>) -> Json<Value> {
+    let now_unix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    let svc = &state.svc_status;
+    let health = state.health.load();
+    let tick_count = svc.tick_count.load(Ordering::Relaxed);
+    let last_tick = svc.last_tick_unix_secs.load(Ordering::Relaxed);
+    let last_tick_age_secs: Option<u64> = if last_tick == 0 {
+        None
+    } else {
+        Some(now_unix.saturating_sub(last_tick))
+    };
+
+    Json(serde_json::json!({
+        "asmo_version": env!("CARGO_PKG_VERSION"),
+        "uptime_secs": now_unix.saturating_sub(svc.started_unix_secs),
+        "bind_addr": &*svc.bind_addr,
+        "poll_interval_ms": svc.poll_interval_ms,
+        "core_count": svc.core_count,
+        "monitor": {
+            "health": health,
+            "rish_retry_count": svc.rish_retry_count.load(Ordering::Relaxed),
+            "rish_session_count": svc.rish_session_count.load(Ordering::Relaxed),
+            "tick_count": tick_count,
+            "last_tick_age_secs": last_tick_age_secs,
+        },
+        "sysfs": {
+            "cpu_temp_path": &*svc.cpu_temp_path,
+            "cpu_temp_ok": svc.cpu_temp_ok.load(Ordering::Relaxed),
+            "gpu_temp_path": &*svc.gpu_temp_path,
+            "gpu_temp_ok": svc.gpu_temp_ok.load(Ordering::Relaxed),
+            "gpu_load_ok": svc.gpu_load_ok.load(Ordering::Relaxed),
+        }
+    }))
+}
+
 /// `GET /{path}` — Resolves an arbitrary path against the current stats.
 ///
 /// Supports comma-separated fields in the last segment and wildcards (`*` / `all`)
@@ -95,8 +143,14 @@ async fn resolve(
     let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
 
     match resolve_request(&tree, &segments) {
-        Some(v) => Json(v).into_response(),
-        None => error_response(StatusCode::NOT_FOUND, "not found", &path),
+        Some(v) => {
+            debug!(path = %path, "request resolved");
+            Json(v).into_response()
+        }
+        None => {
+            debug!(path = %path, "request not found — 404");
+            error_response(StatusCode::NOT_FOUND, "not found", &path)
+        }
     }
 }
 

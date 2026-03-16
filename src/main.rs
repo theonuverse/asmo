@@ -4,15 +4,16 @@ mod router;
 mod types;
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use clap::Parser;
 use local_ip_address::local_ip;
 use tokio::net::TcpListener;
 use tokio::sync::watch;
 use tracing::info;
+use tracing_subscriber::EnvFilter;
 
-use types::{AtomicHealth, SystemStats};
+use types::{AtomicHealth, ServiceStatus, SystemStats};
 
 /// Lightweight REST API server exposing real-time Android device stats.
 #[derive(Parser)]
@@ -33,9 +34,20 @@ struct Args {
 
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::fmt::init();
+    // Respect RUST_LOG for runtime verbosity without recompiling.
+    // Examples: RUST_LOG=debug  RUST_LOG=asmo=debug  RUST_LOG=warn
+    // Defaults to info — clean output suitable for service logs.
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("info"));
+    tracing_subscriber::fmt().with_env_filter(filter).init();
 
     let args = Args::parse();
+    let addr = format!("{}:{}", args.bind, args.port);
+
+    let started_unix_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
 
     let (paths, static_info) = discover::discover_device_layout();
     let static_info = Arc::new(static_info);
@@ -44,21 +56,38 @@ async fn main() {
     let (tx, rx) = watch::channel(SystemStats::default());
     let poll_interval = Duration::from_millis(args.interval);
 
+    let svc_status = Arc::new(ServiceStatus::new(
+        started_unix_secs,
+        args.interval,
+        &paths.cpu_temp,
+        &paths.gpu_temp,
+        &addr,
+        static_info.cores.len(),
+    ));
+
+    info!(
+        version = env!("CARGO_PKG_VERSION"),
+        bind = %addr,
+        interval_ms = args.interval,
+        cores = static_info.cores.len(),
+        "asmo starting"
+    );
+
     tokio::spawn(monitor::run_monitor(
         tx,
         paths,
         Arc::clone(&static_info),
         Arc::clone(&health),
+        Arc::clone(&svc_status),
         poll_interval,
     ));
 
-    let app = router::build(rx, health);
+    let app = router::build(rx, health, Arc::clone(&svc_status));
 
-    let addr = format!("{}:{}", args.bind, args.port);
     let listener = TcpListener::bind(&addr)
         .await
         .unwrap_or_else(|e| {
-            eprintln!("failed to bind {addr}: {e}");
+            tracing::error!(addr = %addr, error = %e, "failed to bind TCP listener");
             std::process::exit(1);
         });
 
@@ -66,15 +95,15 @@ async fn main() {
         .map(|ip| ip.to_string())
         .unwrap_or_else(|_| "localhost".into());
 
-    info!(addr = %addr, "asmo v{} started", env!("CARGO_PKG_VERSION"));
-    println!("\n\u{1F680} Asmo running on: http://{host}:{}", args.port);
-    println!("   GET / for all available endpoints\n");
+    info!(addr = %addr, "TCP listener bound");
+    println!("\n\u{1F680} Asmo v{} running on: http://{host}:{}", env!("CARGO_PKG_VERSION"), args.port);
+    println!("   GET / for all endpoints \u{00B7} GET /debug for service diagnostics\n");
 
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await
         .unwrap_or_else(|e| {
-            eprintln!("server error: {e}");
+            tracing::error!(error = %e, "HTTP server error");
             std::process::exit(1);
         });
 

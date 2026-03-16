@@ -249,6 +249,113 @@ cp target/release/asmo $PREFIX/bin/
 
 > **Tip:** If you just want to test without installing, run `cargo run --release` from the project directory.
 
+## Running as a Termux service
+
+The included `setup.sh` handles everything — it builds asmo, installs the binary, and registers and starts it as a supervised runit service via [termux-services](https://wiki.termux.com/wiki/Termux-services).
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/theonuverse/asmo/main/setup.sh | sh
+```
+
+> **Prerequisites:** [Shizuku](https://shizuku.rikka.app/) must be running. `termux-services` will be installed automatically if missing — you will then be asked to restart Termux once and re-run the script.
+
+Once done, asmo starts automatically on every Termux session.
+
+## Termux service management
+
+All service control uses the standard `sv` tool from runit.
+
+### Core commands
+
+| Command | Effect |
+|---|---|
+| `sv status asmo` | Show current state: `run`, `down`, or `finish` |
+| `sv up asmo` | Start the service if it is stopped |
+| `sv down asmo` | Stop the service gracefully |
+| `sv restart asmo` | Graceful stop then restart |
+| `sv once asmo` | Start once, do not restart on exit |
+
+### Boot persistence
+
+```sh
+sv-enable asmo    # start automatically on every Termux session open (done by setup.sh)
+sv-disable asmo   # remove from auto-start
+```
+
+`sv-enable` registers the service with runsvdir by creating a symlink under `$PREFIX/var/service/`. The daemon watches that directory and automatically restarts asmo if it crashes.
+
+### Viewing logs
+
+asmo logs everything through the runit log pipeline. Logs are rotated automatically by `svlogd`.
+
+```sh
+# Follow live output (the active log file is always named 'current')
+tail -f $PREFIX/var/log/asmo/current
+
+# Show the last 50 lines
+tail -50 $PREFIX/var/log/asmo/current
+
+# Search for errors
+grep -i error $PREFIX/var/log/asmo/current
+
+# List all rotated log segments
+ls $PREFIX/var/log/asmo/
+```
+
+The log runner script uses `svlogd -tt` which prefixes every line with a human-readable timestamp — no extra tools needed.
+
+### Controlling log verbosity
+
+asmo reads `RUST_LOG` to set verbosity. The default is `info`. To change it, edit the run script:
+
+```sh
+nano $PREFIX/etc/sv/asmo/run
+```
+
+The script looks like this — uncomment the `RUST_LOG=debug` line:
+
+```sh
+#!/data/data/com.termux/files/usr/bin/sh
+exec 2>&1
+# export RUST_LOG=debug   ← uncomment for verbose mode (debug, info, warn, error)
+exec asmo
+```
+
+Then restart:
+
+```sh
+sv restart asmo
+```
+
+Available levels from quietest to most verbose: `error`, `warn`, `info` (default), `debug`.
+
+### Service file locations
+
+| Path | Purpose |
+|---|---|
+| `$PREFIX/etc/sv/asmo/run` | Service start script |
+| `$PREFIX/etc/sv/asmo/log/run` | Log pipeline script |
+| `$PREFIX/var/log/asmo/current` | Active log file |
+| `$PREFIX/var/service/asmo` | Symlink that registers the service with runsvdir |
+
+### Changing configuration
+
+Pass CLI flags inside the run script. Edit it and restart:
+
+```sh
+nano $PREFIX/etc/sv/asmo/run
+```
+
+```sh
+#!/data/data/com.termux/files/usr/bin/sh
+exec 2>&1
+exec asmo --port 8080 --bind 127.0.0.1 --interval 200
+```
+
+```sh
+sv restart asmo
+```
+
 ## Usage
 
 ```sh
@@ -404,6 +511,135 @@ types.rs       → Shared data structures (zero-copy Arc<str> strings, typed Bat
 5. The resolved value is returned as JSON.
 
 This means **any new field** added to `SystemStats` (or its nested structs) is instantly available as an endpoint — no manual route registration, no boilerplate.
+
+## Debugging & troubleshooting
+
+### Quick health check
+
+```sh
+# Monitor health from the API
+curl -s localhost:3000/health | jq .
+# → {"status":"healthy"}  (or "degraded" / "dead" / "starting")
+
+# Deep diagnostics endpoint
+curl -s localhost:3000/debug | jq .
+```
+
+The `/debug` endpoint exposes the full runtime state:
+
+```json
+{
+  "asmo_version": "0.5.0",
+  "uptime_secs": 3812,
+  "bind_addr": "0.0.0.0:3000",
+  "poll_interval_ms": 500,
+  "core_count": 8,
+  "monitor": {
+    "health": "healthy",
+    "rish_retry_count": 0,
+    "rish_session_count": 1,
+    "tick_count": 7624,
+    "last_tick_age_secs": 0
+  },
+  "sysfs": {
+    "cpu_temp_path": "/sys/class/thermal/thermal_zone12/temp",
+    "cpu_temp_ok": true,
+    "gpu_temp_path": "/sys/class/thermal/thermal_zone18/temp",
+    "gpu_temp_ok": true,
+    "gpu_load_ok": true
+  }
+}
+```
+
+### Common issues
+
+#### Service won’t start or stays `down`
+
+```sh
+# Check supervision state
+sv status asmo
+
+# Read the startup log
+tail -20 $PREFIX/var/log/asmo/current
+
+# Try running the binary directly to see raw errors
+asmo
+```
+
+If `asmo: command not found`, the binary was not installed to `$PREFIX/bin/`. Re-run `setup.sh`.
+
+#### `rish` won’t connect / monitor health is `degraded`
+
+asmo’s monitor requires [Shizuku](https://shizuku.rikka.app/) to be running and Termux to be authorized.
+
+```sh
+# Test rish access directly
+rish -c 'echo rish ok'
+
+# If that fails: open Shizuku, tap Pairing, and authorize Termux.
+# asmo will retry up to 5 times automatically once Shizuku is available.
+```
+
+Watch retries in the log:
+
+```sh
+tail -f $PREFIX/var/log/asmo/current | grep -i rish
+```
+
+#### CPU or GPU temperature shows `null`
+
+The thermal sysfs paths are auto-detected at startup. Get the chosen paths and their status:
+
+```sh
+curl -s localhost:3000/debug | jq .sysfs
+```
+
+List all thermal zones to find the right one for your device:
+
+```sh
+for z in /sys/class/thermal/thermal_zone*/; do
+  printf "%s  type=%s\n" "$z" "$(cat ${z}type 2>/dev/null)"
+done
+```
+
+#### Service stopped producing data
+
+```sh
+# Check health and tick count
+curl -s localhost:3000/debug | jq .monitor
+
+# Watch tick_count — should increase every ~500 ms
+watch -n1 'curl -s localhost:3000/debug | jq .monitor.tick_count'
+```
+
+If `last_tick_age_secs` is growing and health is `degraded`, asmo is failing to keep rish connected. Check Shizuku.
+
+#### Enable full debug logging
+
+```sh
+# Add RUST_LOG=debug before the exec line
+sed -i 's|^exec asmo|export RUST_LOG=debug\nexec asmo|' $PREFIX/etc/sv/asmo/run
+sv restart asmo
+tail -f $PREFIX/var/log/asmo/current
+```
+
+To revert:
+
+```sh
+sed -i '/^export RUST_LOG/d' $PREFIX/etc/sv/asmo/run
+sv restart asmo
+```
+
+### Troubleshooting checklist
+
+Work through these in order when something is wrong:
+
+1. `sv status asmo` — is runit supervising the service?
+2. `tail -20 $PREFIX/var/log/asmo/current` — what did asmo log at startup?
+3. `curl -s localhost:3000/health` — is the HTTP server responding?
+4. `curl -s localhost:3000/debug | jq .` — full internal runtime state
+5. `rish -c 'echo ok'` — can asmo reach Shizuku?
+6. Enable `RUST_LOG=debug` and restart — every probe, tick, and connection event becomes visible
 
 ## License
 

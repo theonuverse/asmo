@@ -1,17 +1,17 @@
 use std::ffi::CString;
 use std::process::Stdio;
 use std::sync::Arc;
-use std::time::Duration;
+use std::sync::atomic::Ordering;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
 use tokio::process::{Child, ChildStdout, Command};
 use tokio::sync::watch;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
-use crate::types::{
-    AtomicHealth, BatteryStatus, CoreData, CpuSnap, DevicePaths, MemoryInfo, MonitorHealth,
-    StaticDeviceInfo, StorageInfo, SystemStats,
-};
+use crate::types::
+    {AtomicHealth, BatteryStatus, CoreData, CpuSnap, DevicePaths, MemoryInfo, MonitorHealth,
+    ServiceStatus, StaticDeviceInfo, StorageInfo, SystemStats};
 
 const MAX_RISH_RETRIES: u32 = 5;
 const RISH_RETRY_DELAY: Duration = Duration::from_secs(2);
@@ -48,6 +48,7 @@ pub async fn run_monitor(
     paths: DevicePaths,
     static_info: Arc<StaticDeviceInfo>,
     health: Arc<AtomicHealth>,
+    svc_status: Arc<ServiceStatus>,
     poll_interval: Duration,
 ) {
     let core_len = static_info.cores.len();
@@ -66,8 +67,14 @@ pub async fn run_monitor(
             Some(c) => c,
             None => {
                 retries += 1;
+                svc_status.rish_retry_count.store(retries, Ordering::Relaxed);
                 if retries > MAX_RISH_RETRIES {
-                    error!("rish retry limit exhausted ({MAX_RISH_RETRIES}), monitor stopping");
+                    error!(
+                        retries = retries,
+                        sessions = svc_status.rish_session_count.load(Ordering::Relaxed),
+                        ticks = tick,
+                        "rish retry limit exhausted — monitor dead"
+                    );
                     health.store(MonitorHealth::Dead);
                     return;
                 }
@@ -75,8 +82,8 @@ pub async fn run_monitor(
                 warn!(
                     attempt = retries,
                     max = MAX_RISH_RETRIES,
-                    "retrying in {}s",
-                    RISH_RETRY_DELAY.as_secs()
+                    delay_secs = RISH_RETRY_DELAY.as_secs(),
+                    "rish spawn failed — is Shizuku running? retrying"
                 );
                 tokio::time::sleep(RISH_RETRY_DELAY).await;
                 continue;
@@ -87,9 +94,11 @@ pub async fn run_monitor(
         let stdout = child.stdout.take().expect("piped stdout");
         let mut lines = BufReader::new(stdout).lines();
 
-        info!("rish session established");
+        let session = svc_status.rish_session_count.fetch_add(1, Ordering::Relaxed) + 1;
+        svc_status.rish_retry_count.store(0, Ordering::Relaxed);
         health.store(MonitorHealth::Healthy);
         retries = 0;
+        info!(session = session, ticks_so_far = tick, "rish connected — monitor healthy");
 
         // ── Polling loop (runs until rish dies) ──────────────────────
         loop {
@@ -105,6 +114,30 @@ pub async fn run_monitor(
             let mem = read_memory();
             let cur_freqs = read_cpu_freqs(core_len);
 
+            // Track sysfs availability and log transitions so path-miss issues
+            // are immediately visible without enabling debug verbosity.
+            let prev_cpu_ok = svc_status.cpu_temp_ok.swap(cpu_temp.is_some(), Ordering::Relaxed);
+            if prev_cpu_ok && cpu_temp.is_none() {
+                warn!(path = %paths.cpu_temp, tick = tick, "cpu thermal sysfs read failed — check path");
+            } else if !prev_cpu_ok && cpu_temp.is_some() && tick > 0 {
+                info!(path = %paths.cpu_temp, tick = tick, "cpu thermal sysfs read recovered");
+            }
+
+            let prev_gpu_temp_ok = svc_status.gpu_temp_ok.swap(gpu_temp.is_some(), Ordering::Relaxed);
+            if prev_gpu_temp_ok && gpu_temp.is_none() {
+                warn!(path = %paths.gpu_temp, tick = tick, "gpu thermal sysfs read failed — check path");
+            } else if !prev_gpu_temp_ok && gpu_temp.is_some() && tick > 0 {
+                info!(path = %paths.gpu_temp, tick = tick, "gpu thermal sysfs read recovered");
+            }
+
+            // gpu_load is expected absent on non-Qualcomm SoCs — keep at debug level.
+            let prev_gpu_load_ok = svc_status.gpu_load_ok.swap(gpu_load.is_some(), Ordering::Relaxed);
+            if prev_gpu_load_ok && gpu_load.is_none() {
+                debug!(tick = tick, "kgsl gpu load sysfs node became unavailable");
+            } else if !prev_gpu_load_ok && gpu_load.is_some() && tick > 0 {
+                info!(tick = tick, "kgsl gpu load sysfs node became available");
+            }
+
             // Storage uses `statvfs` which can block on slow mounts.
             if is_storage_tick {
                 cached_storage = tokio::task::spawn_blocking(read_storage)
@@ -113,13 +146,19 @@ pub async fn run_monitor(
                         warn!(%e, "storage read task panicked");
                         StorageInfo { free_gb: 0.0, total_gb: 0.0 }
                     });
+                debug!(
+                    free_gb = cached_storage.free_gb,
+                    total_gb = cached_storage.total_gb,
+                    tick = tick,
+                    "storage stats refreshed"
+                );
             }
 
             // Write command batch to rish.
             if stdin.write_all(RISH_CMD).await.is_err()
                 || stdin.flush().await.is_err()
             {
-                error!("rish stdin pipe broken");
+                error!(tick = tick, session = svc_status.rish_session_count.load(Ordering::Relaxed), "rish stdin pipe broken — restarting");
                 break;
             }
 
@@ -131,7 +170,7 @@ pub async fn run_monitor(
             )
             .await
             else {
-                error!("rish output stream ended unexpectedly");
+                error!(tick = tick, session = svc_status.rish_session_count.load(Ordering::Relaxed), "rish output stream ended — restarting");
                 break;
             };
 
@@ -172,6 +211,30 @@ pub async fn run_monitor(
 
             let _ = tx.send(stats);
             tick += 1;
+            // Sync tick counter and timestamp into shared status for /debug endpoint.
+            svc_status.tick_count.store(tick, Ordering::Relaxed);
+            svc_status.last_tick_unix_secs.store(
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0),
+                Ordering::Relaxed,
+            );
+            debug!(
+                tick = tick,
+                battery = rish.battery_level,
+                uptime_s = rish.uptime_seconds,
+                "tick dispatched"
+            );
+            // Periodic info-level heartbeat so the service produces visible output
+            // even when there is nothing unusual to report.
+            if tick % 500 == 0 {
+                info!(
+                    tick = tick,
+                    session = svc_status.rish_session_count.load(Ordering::Relaxed),
+                    "monitor heartbeat"
+                );
+            }
             tokio::time::sleep(poll_interval).await;
         }
 
@@ -180,8 +243,14 @@ pub async fn run_monitor(
         let _ = child.wait().await;
 
         retries += 1;
+        svc_status.rish_retry_count.store(retries, Ordering::Relaxed);
         if retries > MAX_RISH_RETRIES {
-            error!("rish retry limit exhausted ({MAX_RISH_RETRIES}), monitor stopping");
+            error!(
+                retries = retries,
+                sessions = svc_status.rish_session_count.load(Ordering::Relaxed),
+                ticks = tick,
+                "rish retry limit exhausted — monitor dead"
+            );
             health.store(MonitorHealth::Dead);
             return;
         }
@@ -189,8 +258,9 @@ pub async fn run_monitor(
         warn!(
             attempt = retries,
             max = MAX_RISH_RETRIES,
-            "restarting rish in {}s",
-            RISH_RETRY_DELAY.as_secs()
+            delay_secs = RISH_RETRY_DELAY.as_secs(),
+            tick = tick,
+            "rish session lost — is Shizuku still running? restarting"
         );
         tokio::time::sleep(RISH_RETRY_DELAY).await;
     }

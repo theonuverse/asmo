@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 
 use serde::Serialize;
@@ -179,6 +179,72 @@ pub struct MemoryInfo {
 pub struct StorageInfo {
     pub free_gb: f32,
     pub total_gb: f32,
+}
+
+// ---------------------------------------------------------------------------
+// Runtime service diagnostics — shared between the monitor task and the
+// /debug HTTP endpoint so operators can inspect internal state without
+// attaching a debugger or tailing raw logs.
+// ---------------------------------------------------------------------------
+
+/// Atomic counters and config knobs surfaced by `GET /debug`.
+pub struct ServiceStatus {
+    /// Consecutive rish restart attempts in the current failure sequence.
+    /// Reset to 0 after a successful reconnect.
+    pub rish_retry_count: AtomicU32,
+    /// Total successful rish sessions opened since startup.
+    pub rish_session_count: AtomicU32,
+    /// Total monitoring ticks dispatched since startup.
+    pub tick_count: AtomicU64,
+    /// Unix timestamp (seconds) of the most recent completed tick.
+    /// `0` until the first tick completes.
+    pub last_tick_unix_secs: AtomicU64,
+    /// Unix timestamp (seconds) at which asmo started.
+    pub started_unix_secs: u64,
+    /// Configured poll interval in milliseconds.
+    pub poll_interval_ms: u64,
+    /// sysfs path used for CPU temperature reads.
+    pub cpu_temp_path: Box<str>,
+    /// sysfs path used for GPU temperature reads.
+    pub gpu_temp_path: Box<str>,
+    /// Whether the most recent CPU temp sysfs read succeeded.
+    pub cpu_temp_ok: AtomicBool,
+    /// Whether the most recent GPU temp sysfs read succeeded.
+    pub gpu_temp_ok: AtomicBool,
+    /// Whether the kgsl GPU-load sysfs node is readable on this device.
+    /// `false` on non-Qualcomm SoCs — expected and not an error.
+    pub gpu_load_ok: AtomicBool,
+    /// Configured TCP bind address (e.g. "0.0.0.0:3000").
+    pub bind_addr: Box<str>,
+    /// Number of CPU cores detected at startup.
+    pub core_count: usize,
+}
+
+impl ServiceStatus {
+    pub fn new(
+        started_unix_secs: u64,
+        poll_interval_ms: u64,
+        cpu_temp_path: &str,
+        gpu_temp_path: &str,
+        bind_addr: &str,
+        core_count: usize,
+    ) -> Self {
+        Self {
+            rish_retry_count: AtomicU32::new(0),
+            rish_session_count: AtomicU32::new(0),
+            tick_count: AtomicU64::new(0),
+            last_tick_unix_secs: AtomicU64::new(0),
+            started_unix_secs,
+            poll_interval_ms,
+            cpu_temp_path: cpu_temp_path.into(),
+            gpu_temp_path: gpu_temp_path.into(),
+            cpu_temp_ok: AtomicBool::new(false),
+            gpu_temp_ok: AtomicBool::new(false),
+            gpu_load_ok: AtomicBool::new(false),
+            bind_addr: bind_addr.into(),
+            core_count,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
