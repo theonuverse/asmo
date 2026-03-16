@@ -9,6 +9,7 @@ BIN="$PREFIX/bin/asmo"
 SV_DIR="$PREFIX/etc/sv/asmo"
 LOG_DIR="$PREFIX/var/log/asmo"
 SERVICE_LINK="$PREFIX/var/service/asmo"
+MAX_REGISTER_WAIT=15
 
 echo ""
 echo "=== asmo v0.5.0 service setup ==="
@@ -72,7 +73,16 @@ if ! pgrep -x runsvdir >/dev/null 2>&1; then
     fi
 fi
 
+if ! pgrep -x runsvdir >/dev/null 2>&1; then
+    echo "ERROR: runsvdir is not running."
+    echo "Close and reopen Termux, then run sv_setup.sh again."
+    exit 1
+fi
+
 echo "[4/6] Writing service files..."
+# Re-create service directory from scratch to avoid stale supervise state
+# when running this script repeatedly.
+rm -rf "$SV_DIR"
 mkdir -p "$SV_DIR/log"
 mkdir -p "$LOG_DIR"
 mkdir -p "$PREFIX/var/service"
@@ -81,7 +91,7 @@ mkdir -p "$PREFIX/var/service"
 # Keep execution wrapped in `script -q -c` to allocate a pseudo-tty.
 cat > "$SV_DIR/run" << 'RUNEOF'
 #!/data/data/com.termux/files/usr/bin/sh
-exec script -q -c "asmo" /dev/null 2>&1
+exec script -q -c "$PREFIX/bin/asmo" /dev/null 2>&1
 RUNEOF
 
 cat > "$SV_DIR/log/run" << LOGEOF
@@ -113,6 +123,28 @@ if [ ! -e "$SERVICE_LINK" ]; then
     echo "  ls -l  $PREFIX/var/service"
     exit 1
 fi
+
+echo "  waiting for runit to register service (supervise/ok)..."
+count=0
+while [ ! -e "$SV_DIR/supervise/ok" ] && [ $count -lt $MAX_REGISTER_WAIT ]; do
+    sleep 1
+    count=$((count + 1))
+done
+
+if [ ! -e "$SV_DIR/supervise/ok" ]; then
+    echo "ERROR: service did not register within ${MAX_REGISTER_WAIT}s"
+    echo "Debug checks:"
+    echo "  ps -ef | grep runsvdir"
+    echo "  ls -ld $SV_DIR"
+    echo "  ls -la $SV_DIR"
+    exit 1
+fi
+
+count=0
+while [ ! -e "$SV_DIR/log/supervise/ok" ] && [ $count -lt $MAX_REGISTER_WAIT ]; do
+    sleep 1
+    count=$((count + 1))
+done
 
 echo "[6/6] Starting service with sv up..."
 sv up asmo || {
