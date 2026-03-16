@@ -10,7 +10,7 @@ SV_DIR="$PREFIX/etc/sv/asmo"
 LOG_DIR="$PREFIX/var/log/asmo"
 SERVICE_LINK="$PREFIX/var/service/asmo"
 MAX_REGISTER_WAIT=20
-MAX_START_RETRIES=25
+MAX_START_RETRIES=40
 
 echo ""
 echo "=== asmo v0.5.0 service setup ==="
@@ -156,19 +156,36 @@ sv down asmo >/dev/null 2>&1 || true
 sleep 1
 started=0
 retry=0
+last_status=""
 while [ $retry -lt $MAX_START_RETRIES ]; do
-    # Require both: command success and supervise socket exists.
-    if sv up asmo >/dev/null 2>&1 && [ -S "$SV_DIR/supervise/ok" ]; then
-        started=1
-        break
+    # Fire start request (may return non-zero during runit registration races).
+    sv up asmo >/dev/null 2>&1 || true
+
+    # Authoritative success check is service state, not sv up exit code.
+    last_status="$(sv status asmo 2>&1 || true)"
+    case "$last_status" in
+        run:*)
+            started=1
+            break
+            ;;
+    esac
+
+    if [ $retry -eq 0 ]; then
+        echo "  waiting for service to reach run state..."
     fi
     retry=$((retry + 1))
     sleep 1
 done
 
 if [ $started -ne 1 ]; then
+    # One final status pull for error output.
+    last_status="$(sv status asmo 2>&1 || true)"
+fi
+
+if [ $started -ne 1 ]; then
     echo ""
-    echo "ERROR: sv up asmo failed after ${MAX_START_RETRIES} retries."
+    echo "ERROR: asmo did not reach run state after ${MAX_START_RETRIES}s."
+    echo "last sv status: $last_status"
     echo "Debug steps:"
     echo "  sv status asmo"
     echo "  ps -ef | grep runsvdir"
@@ -180,6 +197,7 @@ if [ $started -ne 1 ]; then
     exit 1
 fi
 
+echo "  service reached run state"
 echo ""
 echo "=== Service setup complete ==="
 echo ""
