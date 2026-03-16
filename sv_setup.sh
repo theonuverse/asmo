@@ -9,7 +9,7 @@ BIN="$PREFIX/bin/asmo"
 SV_DIR="$PREFIX/etc/sv/asmo"
 LOG_DIR="$PREFIX/var/log/asmo"
 SERVICE_LINK="$PREFIX/var/service/asmo"
-MAX_REGISTER_WAIT=15
+MAX_REGISTER_WAIT=20
 
 echo ""
 echo "=== asmo v0.5.0 service setup ==="
@@ -38,13 +38,12 @@ if ! command -v sv >/dev/null 2>&1; then
     echo "Close and reopen Termux once, then re-run sv_setup.sh."
     exit 0
 fi
-if ! command -v sv-enable >/dev/null 2>&1; then
-    echo "ERROR: sv-enable not available. Ensure termux-services is fully initialized."
-    echo "Try reopening Termux and running again."
-    exit 1
-fi
 echo "  found: $(command -v sv)"
-echo "  found: $(command -v sv-enable)"
+if command -v sv-enable >/dev/null 2>&1; then
+    echo "  found: $(command -v sv-enable)"
+else
+    echo "  sv-enable not found; using symlink activation only"
+fi
 
 echo "[3/6] Checking rish availability (required)..."
 if ! command -v rish >/dev/null 2>&1; then
@@ -73,12 +72,6 @@ if ! pgrep -x runsvdir >/dev/null 2>&1; then
     fi
 fi
 
-if ! pgrep -x runsvdir >/dev/null 2>&1; then
-    echo "ERROR: runsvdir is not running."
-    echo "Close and reopen Termux, then run sv_setup.sh again."
-    exit 1
-fi
-
 echo "[4/6] Writing service files..."
 # Re-create service directory from scratch to avoid stale supervise state
 # when running this script repeatedly.
@@ -91,7 +84,8 @@ mkdir -p "$PREFIX/var/service"
 # Keep execution wrapped in `script -q -c` to allocate a pseudo-tty.
 cat > "$SV_DIR/run" << 'RUNEOF'
 #!/data/data/com.termux/files/usr/bin/sh
-exec script -q -c "$PREFIX/bin/asmo" /dev/null 2>&1
+exec 2>&1
+exec script -q -c "/data/data/com.termux/files/usr/bin/asmo" /dev/null
 RUNEOF
 
 cat > "$SV_DIR/log/run" << LOGEOF
@@ -102,17 +96,14 @@ LOGEOF
 chmod +x "$SV_DIR/run"
 chmod +x "$SV_DIR/log/run"
 
-echo "[5/6] Enabling service with sv-enable..."
-# On some Termux setups sv-enable prints a transient sv error even though
-# the enable link is created correctly. Continue and validate via symlink.
-if ! sv-enable asmo; then
-    echo "  warning: sv-enable returned non-zero; checking service link..."
-fi
+echo "[5/6] Enabling service..."
+# Primary activation path: direct link in var/service (most reliable in Termux).
+ln -snf "$SV_DIR" "$SERVICE_LINK"
 
-if [ ! -e "$SERVICE_LINK" ]; then
-    echo "  sv-enable did not create link, applying fallback:"
-    echo "    ln -snf $SV_DIR $SERVICE_LINK"
-    ln -snf "$SV_DIR" "$SERVICE_LINK"
+# Best-effort call to sv-enable for compatibility. Ignore failures because some
+# Termux builds print an sv error here even though the link method works.
+if command -v sv-enable >/dev/null 2>&1; then
+    sv-enable asmo >/dev/null 2>&1 || true
 fi
 
 if [ ! -e "$SERVICE_LINK" ]; then
@@ -126,12 +117,12 @@ fi
 
 echo "  waiting for runit to register service (supervise/ok)..."
 count=0
-while [ ! -e "$SV_DIR/supervise/ok" ] && [ $count -lt $MAX_REGISTER_WAIT ]; do
+while [ ! -S "$SV_DIR/supervise/ok" ] && [ $count -lt $MAX_REGISTER_WAIT ]; do
     sleep 1
     count=$((count + 1))
 done
 
-if [ ! -e "$SV_DIR/supervise/ok" ]; then
+if [ ! -S "$SV_DIR/supervise/ok" ]; then
     echo "ERROR: service did not register within ${MAX_REGISTER_WAIT}s"
     echo "Debug checks:"
     echo "  ps -ef | grep runsvdir"
@@ -141,17 +132,16 @@ if [ ! -e "$SV_DIR/supervise/ok" ]; then
 fi
 
 count=0
-while [ ! -e "$SV_DIR/log/supervise/ok" ] && [ $count -lt $MAX_REGISTER_WAIT ]; do
+while [ ! -S "$SV_DIR/log/supervise/ok" ] && [ $count -lt $MAX_REGISTER_WAIT ]; do
     sleep 1
     count=$((count + 1))
 done
 
 echo "[6/6] Starting service with sv up..."
+# Reset then start for consistent behavior across reruns.
+sv down asmo >/dev/null 2>&1 || true
+sleep 1
 sv up asmo || {
-    echo "  first sv up failed, retrying once in 1s..."
-    sleep 1
-    sv up asmo
-} || {
     echo ""
     echo "ERROR: sv up asmo failed. Debug steps:"
     echo "  sv status asmo"
