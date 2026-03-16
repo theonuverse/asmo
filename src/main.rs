@@ -5,12 +5,13 @@ mod types;
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::process::Command;
 
 use clap::Parser;
 use local_ip_address::local_ip;
 use tokio::net::TcpListener;
 use tokio::sync::watch;
-use tracing::info;
+use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
 use types::{AtomicHealth, ServiceStatus, SystemStats};
@@ -43,6 +44,8 @@ async fn main() {
 
     let args = Args::parse();
     let addr = format!("{}:{}", args.bind, args.port);
+
+    ensure_rish_available_or_exit();
 
     let started_unix_secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -108,6 +111,44 @@ async fn main() {
         });
 
     info!("shutdown complete");
+}
+
+/// Fail-fast preflight: asmo requires a working rish session.
+/// Without rish we cannot collect privileged metrics, so startup is aborted.
+fn ensure_rish_available_or_exit() {
+    let output = Command::new("rish")
+        .args(["-c", "echo asmo_rish_ok"])
+        .output();
+
+    let ok = match output {
+        Ok(out) if out.status.success() => true,
+        Ok(out) => {
+            let stderr = String::from_utf8_lossy(&out.stderr).trim().to_owned();
+            let stdout = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+            error!(
+                status = ?out.status.code(),
+                stdout = %stdout,
+                stderr = %stderr,
+                "rish preflight failed"
+            );
+            false
+        }
+        Err(e) => {
+            error!(error = %e, "rish command not available");
+            false
+        }
+    };
+
+    if !ok {
+        eprintln!(
+            "asmo requires a working rish session and will not start without it.\n\
+             Ensure Shizuku is running and Termux is authorized, then verify:\n\
+             rish -c 'echo ok'"
+        );
+        std::process::exit(1);
+    }
+
+    info!("rish preflight ok");
 }
 
 /// Wait for a shutdown signal (Ctrl+C).

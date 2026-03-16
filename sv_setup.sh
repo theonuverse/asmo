@@ -1,8 +1,7 @@
 #!/data/data/com.termux/files/usr/bin/sh
 # asmo service setup script for Termux
-# Run this from the project directory AFTER:
-# 1) cargo build --release
-# 2) cp target/release/asmo $PREFIX/bin/asmo
+# IMPORTANT: rish (Shizuku) must be available first.
+# asmo will not run without rish.
 
 set -e
 
@@ -15,9 +14,9 @@ echo ""
 echo "=== asmo v0.5.0 service setup ==="
 echo ""
 
-echo "[1/5] Validating current directory and build artifacts..."
+echo "[1/6] Validating current directory and build artifacts..."
 if [ ! -f "Cargo.toml" ] || [ ! -d "src" ]; then
-    echo "ERROR: run setup.sh from the asmo project root."
+    echo "ERROR: run sv_setup.sh from the asmo project root."
     echo "Current directory: $PWD"
     exit 1
 fi
@@ -30,12 +29,12 @@ if [ ! -x "$BIN" ]; then
     exit 1
 fi
 
-echo "[2/5] Checking termux-services tooling..."
+echo "[2/6] Checking termux-services tooling..."
 if ! command -v sv >/dev/null 2>&1; then
     echo "termux-services not found. Installing..."
     pkg install -y termux-services
     echo ""
-    echo "Close and reopen Termux once, then re-run setup.sh."
+    echo "Close and reopen Termux once, then re-run sv_setup.sh."
     exit 0
 fi
 if ! command -v sv-enable >/dev/null 2>&1; then
@@ -45,6 +44,23 @@ if ! command -v sv-enable >/dev/null 2>&1; then
 fi
 echo "  found: $(command -v sv)"
 echo "  found: $(command -v sv-enable)"
+
+echo "[3/6] Checking rish availability (required)..."
+if ! command -v rish >/dev/null 2>&1; then
+    echo "ERROR: rish command not found."
+    echo "asmo requires Shizuku/rish and will NOT run without it."
+    echo "Install/enable Shizuku and ensure rish is available, then run sv_setup.sh again."
+    exit 1
+fi
+
+if ! rish -c 'echo rish_ok' >/dev/null 2>&1; then
+    echo "ERROR: rish is present but not usable in this session."
+    echo "asmo will NOT start without a working rish session."
+    echo "Open Shizuku, authorize Termux, verify: rish -c 'echo ok'"
+    echo "Then run sv_setup.sh again."
+    exit 1
+fi
+echo "  rish is available and working"
 
 # Ensure runsvdir is available in this session. On some devices/services
 # setups, this is not active yet even though termux-services is installed.
@@ -56,7 +72,7 @@ if ! pgrep -x runsvdir >/dev/null 2>&1; then
     fi
 fi
 
-echo "[3/5] Writing service files..."
+echo "[4/6] Writing service files..."
 mkdir -p "$SV_DIR/log"
 mkdir -p "$LOG_DIR"
 mkdir -p "$PREFIX/var/service"
@@ -76,7 +92,7 @@ LOGEOF
 chmod +x "$SV_DIR/run"
 chmod +x "$SV_DIR/log/run"
 
-echo "[4/5] Enabling service with sv-enable..."
+echo "[5/6] Enabling service with sv-enable..."
 # On some Termux setups sv-enable prints a transient sv error even though
 # the enable link is created correctly. Continue and validate via symlink.
 if ! sv-enable asmo; then
@@ -98,7 +114,7 @@ if [ ! -e "$SERVICE_LINK" ]; then
     exit 1
 fi
 
-echo "[5/5] Starting service with sv up..."
+echo "[6/6] Starting service with sv up..."
 sv up asmo || {
     echo "  first sv up failed, retrying once in 1s..."
     sleep 1

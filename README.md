@@ -226,6 +226,9 @@ curl -s localhost:3000/stats | jq '{gpu_load, cores: [.cores[] | {name, usage}]}
 
 - [Termux](https://termux.dev) installed
 - [Shizuku](https://shizuku.rikka.app/) running (provides `rish` for privileged sysfs access)
+- `rish` must be callable from Termux (`rish -c 'echo ok'` must work)
+
+> **Hard requirement:** asmo will **not start** without a working `rish` session.
 
 ## Build from source
 
@@ -251,22 +254,19 @@ cp target/release/asmo $PREFIX/bin/
 
 ## Running as a Termux service
 
-The included `setup.sh` is intentionally service-only. It does **not** clone, build, or install dependencies.
+The included `sv_setup.sh` is intentionally service-only. It does **not** clone, build, or install dependencies.
 
-Use it after you already built and installed asmo:
+Run it from the project directory (after your normal build/install flow):
 
 ```sh
-# from the project directory
-cargo build --release
-cp target/release/asmo $PREFIX/bin/asmo
-
-# then configure runit service
-./setup.sh
+./sv_setup.sh
 ```
 
-`setup.sh` creates the runit files under `$PREFIX/etc/sv/asmo`, enables the service with `sv-enable asmo`, and starts it with `sv up asmo`.
+`sv_setup.sh` creates the runit files under `$PREFIX/etc/sv/asmo`, enables the service with `sv-enable asmo`, and starts it with `sv up asmo`.
 
-> **Prerequisites:** [Shizuku](https://shizuku.rikka.app/) must be running. `termux-services` must be available (the script installs it if missing and asks for one Termux restart).
+> **Prerequisites:** [Shizuku](https://shizuku.rikka.app/) must be running and `rish` must work before setup. `termux-services` must be available (the script installs it if missing and asks for one Termux restart).
+
+If `rish -c 'echo ok'` fails, asmo service setup aborts and asmo itself will not start.
 
 The service runner uses `exec script -q -c "asmo" /dev/null 2>&1` so `rish` has a tty.
 
@@ -287,7 +287,7 @@ All service control uses the standard `sv` tool from runit.
 ### Boot persistence
 
 ```sh
-sv-enable asmo    # start automatically on every Termux session open (done by setup.sh)
+sv-enable asmo    # start automatically on every Termux session open (done by sv_setup.sh)
 sv-disable asmo   # remove from auto-start
 ```
 
@@ -577,19 +577,20 @@ If `asmo: command not found`, the binary was not installed to `$PREFIX/bin/`. Re
 ```sh
 cargo build --release
 cp target/release/asmo $PREFIX/bin/asmo
-./setup.sh
+./sv_setup.sh
 ```
 
-#### `rish` won’t connect / monitor health is `degraded`
+#### `rish` not available / service exits immediately
 
-asmo’s monitor requires [Shizuku](https://shizuku.rikka.app/) to be running and Termux to be authorized.
+asmo requires [Shizuku](https://shizuku.rikka.app/) and a working `rish` session before startup.
+If `rish` is unavailable, asmo exits immediately by design.
 
 ```sh
 # Test rish access directly
 rish -c 'echo rish ok'
 
 # If that fails: open Shizuku, tap Pairing, and authorize Termux.
-# asmo will retry up to 5 times automatically once Shizuku is available.
+# Then restart asmo once rish works.
 ```
 
 Watch retries in the log:
