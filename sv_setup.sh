@@ -123,6 +123,12 @@ if [ ! -e "$SERVICE_LINK" ]; then
     exit 1
 fi
 
+# Kill stale per-service supervisors so runsvdir can spawn a fresh one bound to
+# the current service directory state. This avoids lingering broken runsv trees
+# from previous failed setup attempts.
+pkill -f "runsv asmo" >/dev/null 2>&1 || true
+sleep 1
+
 echo "  waiting for runit to register service (supervise/ok)..."
 count=0
 while [ ! -S "$SV_DIR/supervise/ok" ] && [ $count -lt $MAX_REGISTER_WAIT ]; do
@@ -151,7 +157,8 @@ sleep 1
 started=0
 retry=0
 while [ $retry -lt $MAX_START_RETRIES ]; do
-    if sv up asmo >/dev/null 2>&1; then
+    # Require both: command success and supervise socket exists.
+    if sv up asmo >/dev/null 2>&1 && [ -S "$SV_DIR/supervise/ok" ]; then
         started=1
         break
     fi
@@ -168,6 +175,7 @@ if [ $started -ne 1 ]; then
     echo "  ps -ef | grep runsv"
     echo "  ls -l $PREFIX/var/service"
     echo "  ls -la $SV_DIR"
+    echo "  ls -la $SV_DIR/log"
     echo "  tail -50 $LOG_DIR/current"
     exit 1
 fi
