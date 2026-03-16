@@ -46,6 +46,16 @@ fi
 echo "  found: $(command -v sv)"
 echo "  found: $(command -v sv-enable)"
 
+# Ensure runsvdir is available in this session. On some devices/services
+# setups, this is not active yet even though termux-services is installed.
+if ! pgrep -x runsvdir >/dev/null 2>&1; then
+    if [ -f "$PREFIX/etc/profile.d/start-services.sh" ]; then
+        echo "  starting runsvdir for this session..."
+        . "$PREFIX/etc/profile.d/start-services.sh" || true
+        sleep 1
+    fi
+fi
+
 echo "[3/5] Writing service files..."
 mkdir -p "$SV_DIR/log"
 mkdir -p "$LOG_DIR"
@@ -70,14 +80,21 @@ echo "[4/5] Enabling service with sv-enable..."
 # On some Termux setups sv-enable prints a transient sv error even though
 # the enable link is created correctly. Continue and validate via symlink.
 if ! sv-enable asmo; then
-    echo "  warning: sv-enable returned non-zero; validating service link..."
+    echo "  warning: sv-enable returned non-zero; checking service link..."
 fi
 
 if [ ! -e "$SERVICE_LINK" ]; then
-    echo "ERROR: sv-enable did not create $SERVICE_LINK"
-    echo "This usually means termux-services is not fully initialized yet."
-    echo "Close and reopen Termux, then run:"
-    echo "  ./setup.sh"
+    echo "  sv-enable did not create link, applying fallback:"
+    echo "    ln -snf $SV_DIR $SERVICE_LINK"
+    ln -snf "$SV_DIR" "$SERVICE_LINK"
+fi
+
+if [ ! -e "$SERVICE_LINK" ]; then
+    echo "ERROR: service link is still missing: $SERVICE_LINK"
+    echo "Debug checks:"
+    echo "  ls -ld $PREFIX/etc/sv/asmo"
+    echo "  ls -ld $PREFIX/var/service"
+    echo "  ls -l  $PREFIX/var/service"
     exit 1
 fi
 
