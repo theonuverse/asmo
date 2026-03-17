@@ -7,6 +7,8 @@ LOG_SERVICE_DIR="$SV_DIR/log"
 SERVICE_LINK="$PREFIX/var/service/asmo"
 LOG_DIR="$PREFIX/var/log/asmo"
 SERVICE_NAME="asmo"
+VERIFY_TIMEOUT=20
+VERIFY_INTERVAL=1
 
 print_header() {
     printf '\n== %s ==\n' "$1"
@@ -105,10 +107,12 @@ enable_service() {
 
 verify_service() {
     print_header "Verifying service"
+    print_info "Waiting for runit to pick up the new service link. This can take a few seconds."
 
     attempts=0
-    while [ "$attempts" -lt 10 ]; do
-        if [ -S "$SV_DIR/supervise/ok" ]; then
+    max_attempts=$((VERIFY_TIMEOUT / VERIFY_INTERVAL))
+    while [ "$attempts" -lt "$max_attempts" ]; do
+        if [ -e "$SV_DIR/supervise/ok" ] || [ -e "$SERVICE_LINK/supervise/ok" ]; then
             status="$(sv status "$SERVICE_NAME" 2>&1 || true)"
             case "$status" in
                 run:*)
@@ -121,7 +125,7 @@ verify_service() {
         fi
 
         attempts=$((attempts + 1))
-        sleep 1
+        sleep "$VERIFY_INTERVAL"
     done
 
     print_error "Service did not come up in time."
