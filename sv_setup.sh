@@ -57,8 +57,12 @@ ensure_termux_services() {
     print_section "Dependencies"
     print_detail "Installing termux-services."
     pkg install -y termux-services
-    print_warn "termux-services was installed. Restart Termux, then run this script again."
-    exit 0
+    print_success "termux-services installed."
+    if [ -f "$PREFIX/etc/profile.d/start-services.sh" ]; then
+        print_detail "Starting runsvdir for the current shell session."
+        . "$PREFIX/etc/profile.d/start-services.sh"
+        sleep 1
+    fi
 }
 
 require_rish() {
