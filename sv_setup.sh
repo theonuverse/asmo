@@ -1,221 +1,98 @@
 #!/data/data/com.termux/files/usr/bin/sh
-# asmo service setup script for Termux
-# IMPORTANT: rish (Shizuku) must be available first.
-# asmo will not run without rish.
+# slim asmo service setup for Termux + runit
 
 set -e
 
-BIN="$PREFIX/bin/asmo"
 SV_DIR="$PREFIX/etc/sv/asmo"
-LOG_DIR="$PREFIX/var/log/asmo"
 SERVICE_LINK="$PREFIX/var/service/asmo"
-MAX_REGISTER_WAIT=20
-MAX_START_RETRIES=40
+LOG_DIR="$PREFIX/var/log/asmo"
+BIN="$PREFIX/bin/asmo"
 
-echo ""
-echo "=== asmo v0.5.0 service setup ==="
-echo ""
+echo "--- Slim Asmo Setup ---"
 
-echo "[1/6] Validating current directory and build artifacts..."
 if [ ! -f "Cargo.toml" ] || [ ! -d "src" ]; then
     echo "ERROR: run sv_setup.sh from the asmo project root."
-    echo "Current directory: $PWD"
     exit 1
 fi
 
 if [ ! -x "$BIN" ]; then
-    echo "ERROR: $BIN not found or not executable."
-    echo "Build and install first:"
-    echo "  cargo build --release"
+    echo "ERROR: $BIN not found. Install binary first:"
     echo "  cp target/release/asmo \$PREFIX/bin/asmo"
     exit 1
 fi
 
-echo "[2/6] Checking termux-services tooling..."
 if ! command -v sv >/dev/null 2>&1; then
-    echo "termux-services not found. Installing..."
+    echo "termux-services missing, installing..."
     pkg install -y termux-services
-    echo ""
-    echo "Close and reopen Termux once, then re-run sv_setup.sh."
+    echo "Close and reopen Termux, then run sv_setup.sh again."
     exit 0
 fi
-echo "  found: $(command -v sv)"
-if command -v sv-enable >/dev/null 2>&1; then
-    echo "  found: $(command -v sv-enable)"
-else
-    echo "  sv-enable not found; using symlink activation only"
-fi
 
-echo "[3/6] Checking rish availability (required)..."
-if ! command -v rish >/dev/null 2>&1; then
-    echo "ERROR: rish command not found."
-    echo "asmo requires Shizuku/rish and will NOT run without it."
-    echo "Install/enable Shizuku and ensure rish is available, then run sv_setup.sh again."
+if ! rish -c 'true' >/dev/null 2>&1; then
+    echo "ERROR: rish/Shizuku not active."
+    echo "asmo will not start without rish."
     exit 1
 fi
 
-if ! rish -c 'echo rish_ok' >/dev/null 2>&1; then
-    echo "ERROR: rish is present but not usable in this session."
-    echo "asmo will NOT start without a working rish session."
-    echo "Open Shizuku, authorize Termux, verify: rish -c 'echo ok'"
-    echo "Then run sv_setup.sh again."
-    exit 1
-fi
-echo "  rish is available and working"
-
-# Ensure runsvdir is available in this session. On some devices/services
-# setups, this is not active yet even though termux-services is installed.
+# Ensure runsvdir exists for this shell session when possible.
 if ! pgrep -x runsvdir >/dev/null 2>&1; then
     if [ -f "$PREFIX/etc/profile.d/start-services.sh" ]; then
-        echo "  starting runsvdir for this session..."
         . "$PREFIX/etc/profile.d/start-services.sh" || true
-        sleep 2
+        sleep 1
     fi
 fi
 
-echo "[4/6] Writing service files..."
-# Clean old registration first (important when script is rerun many times).
+# Clean stale registration/state.
 sv down asmo >/dev/null 2>&1 || true
-if command -v sv-disable >/dev/null 2>&1; then
-    sv-disable asmo >/dev/null 2>&1 || true
-fi
 rm -f "$SERVICE_LINK"
-sleep 1
-
-# Keep the service directory but remove stale supervise state.
+rm -rf "$SV_DIR"
 mkdir -p "$SV_DIR/log"
 mkdir -p "$LOG_DIR"
 mkdir -p "$PREFIX/var/service"
-rm -rf "$SV_DIR/supervise" "$SV_DIR/log/supervise"
 
-# rish expects a tty in practice on many devices.
-# Keep execution wrapped in `script -q -c` to allocate a pseudo-tty.
-cat > "$SV_DIR/run" << 'RUNEOF'
+cat > "$SV_DIR/run" << EOF
 #!/data/data/com.termux/files/usr/bin/sh
 exec 2>&1
-exec script -q -c "/data/data/com.termux/files/usr/bin/asmo" /dev/null
-RUNEOF
+exec script -q -c "$BIN" /dev/null
+EOF
 
-cat > "$SV_DIR/log/run" << LOGEOF
+cat > "$SV_DIR/log/run" << EOF
 #!/data/data/com.termux/files/usr/bin/sh
 exec svlogd -tt $LOG_DIR
-LOGEOF
+EOF
 
-chmod +x "$SV_DIR/run"
-chmod +x "$SV_DIR/log/run"
+chmod +x "$SV_DIR/run" "$SV_DIR/log/run"
 
-echo "[5/6] Enabling service..."
-# Primary activation path: direct link in var/service (most reliable in Termux).
+# Single activation mechanism: symlink only.
 ln -snf "$SV_DIR" "$SERVICE_LINK"
 
-# Best-effort call to sv-enable for compatibility. Ignore failures because some
-# Termux builds print an sv error here even though the link method works.
-if command -v sv-enable >/dev/null 2>&1; then
-    sv-enable asmo >/dev/null 2>&1 || true
-fi
-
-if [ ! -e "$SERVICE_LINK" ]; then
-    echo "ERROR: service link is still missing: $SERVICE_LINK"
-    echo "Debug checks:"
-    echo "  ls -ld $PREFIX/etc/sv/asmo"
-    echo "  ls -ld $PREFIX/var/service"
-    echo "  ls -l  $PREFIX/var/service"
-    exit 1
-fi
-
-# Kill stale per-service supervisors so runsvdir can spawn a fresh one bound to
-# the current service directory state. This avoids lingering broken runsv trees
-# from previous failed setup attempts.
-pkill -f "runsv asmo" >/dev/null 2>&1 || true
-sleep 1
-
-echo "  waiting for runit to register service (supervise/ok)..."
-count=0
-while [ ! -S "$SV_DIR/supervise/ok" ] && [ $count -lt $MAX_REGISTER_WAIT ]; do
-    sleep 1
-    count=$((count + 1))
-done
-
-if [ ! -S "$SV_DIR/supervise/ok" ]; then
-    echo "  warning: supervise/ok not ready after ${MAX_REGISTER_WAIT}s; trying sv up retries"
-fi
-
-count=0
-while [ ! -S "$SV_DIR/log/supervise/ok" ] && [ $count -lt $MAX_REGISTER_WAIT ]; do
-    sleep 1
-    count=$((count + 1))
-done
-
-if [ ! -S "$SV_DIR/log/supervise/ok" ]; then
-    echo "  warning: log supervise/ok not ready after ${MAX_REGISTER_WAIT}s; continuing"
-fi
-
-echo "[6/6] Starting service with sv up..."
-# Reset then start for consistent behavior across reruns.
-sv down asmo >/dev/null 2>&1 || true
-sleep 1
-started=0
-retry=0
-last_status=""
-while [ $retry -lt $MAX_START_RETRIES ]; do
-    # Fire start request (may return non-zero during runit registration races).
-    sv up asmo >/dev/null 2>&1 || true
-
-    # Authoritative success check is service state, not sv up exit code.
-    last_status="$(sv status asmo 2>&1 || true)"
-    case "$last_status" in
-        run:*)
-            started=1
-            break
-            ;;
-    esac
-
-    if [ $retry -eq 0 ]; then
-        echo "  waiting for service to reach run state..."
+echo "waiting for runit..."
+i=0
+while [ $i -lt 10 ]; do
+    if [ -S "$SV_DIR/supervise/ok" ]; then
+        sv up asmo >/dev/null 2>&1 || true
+        status="$(sv status asmo 2>&1 || true)"
+        case "$status" in
+            run:*)
+                echo "Service setup complete."
+                echo "Status:"
+                sv status asmo || true
+                echo ""
+                echo "Logs: tail -f $LOG_DIR/current"
+                exit 0
+                ;;
+        esac
     fi
-    retry=$((retry + 1))
+    i=$((i + 1))
     sleep 1
 done
 
-if [ $started -ne 1 ]; then
-    # One final status pull for error output.
-    last_status="$(sv status asmo 2>&1 || true)"
-fi
-
-if [ $started -ne 1 ]; then
-    echo ""
-    echo "ERROR: asmo did not reach run state after ${MAX_START_RETRIES}s."
-    echo "last sv status: $last_status"
-    echo "Debug steps:"
-    echo "  sv status asmo"
-    echo "  ps -ef | grep runsvdir"
-    echo "  ps -ef | grep runsv"
-    echo "  ls -l $PREFIX/var/service"
-    echo "  ls -la $SV_DIR"
-    echo "  ls -la $SV_DIR/log"
-    echo "  tail -50 $LOG_DIR/current"
-    exit 1
-fi
-
-echo "  service reached run state"
-echo ""
-echo "=== Service setup complete ==="
-echo ""
-echo "  Current state:"
-sv status asmo || true
-echo ""
-echo "  Service commands:"
-echo "    sv status asmo"
-echo "    sv up asmo"
-echo "    sv down asmo"
-echo "    sv restart asmo"
-echo "    sv-enable asmo"
-echo "    sv-disable asmo"
-echo ""
-echo "  Logs:"
-echo "    tail -f $LOG_DIR/current"
-echo ""
-echo "  API debug:"
-echo "    curl -s localhost:3000/health | jq ."
-echo "    curl -s localhost:3000/debug  | jq ."
-echo ""
+echo "ERROR: runit did not register/start asmo in time."
+echo "Debug checks:"
+echo "  sv status asmo"
+echo "  ps -ef | grep runsvdir"
+echo "  ps -ef | grep runsv"
+echo "  ls -l $PREFIX/var/service"
+echo "  ls -la $SV_DIR"
+echo "  tail -50 $LOG_DIR/current"
+exit 1
