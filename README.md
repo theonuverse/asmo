@@ -262,11 +262,9 @@ Run it from the project directory (after your normal build/install flow):
 ./sv_setup.sh
 ```
 
-`sv_setup.sh` creates the runit files under `$PREFIX/etc/sv/asmo`, enables the service with `sv-enable asmo`, and starts it with `sv up asmo`.
+`sv_setup.sh` creates the runit files under `$PREFIX/etc/sv/asmo`, enables the service and starts it.
 
 > **Prerequisites:** [Shizuku](https://shizuku.rikka.app/) must be running and `rish` must work before setup. `termux-services` must be available (the script installs it if missing and asks for one Termux restart).
-
-If `rish -c 'echo ok'` fails, asmo service setup aborts and asmo itself will not start.
 
 The service runner uses `exec script -q -c "asmo" /dev/null 2>&1` so `rish` has a tty.
 
