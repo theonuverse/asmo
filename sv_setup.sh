@@ -1,98 +1,140 @@
 #!/data/data/com.termux/files/usr/bin/sh
-# slim asmo service setup for Termux + runit
 
 set -e
 
 SV_DIR="$PREFIX/etc/sv/asmo"
+LOG_SERVICE_DIR="$SV_DIR/log"
 SERVICE_LINK="$PREFIX/var/service/asmo"
 LOG_DIR="$PREFIX/var/log/asmo"
-BIN="$PREFIX/bin/asmo"
+SERVICE_NAME="asmo"
 
-echo "--- Slim Asmo Setup ---"
+print_header() {
+    printf '\n== %s ==\n' "$1"
+}
 
-if [ ! -f "Cargo.toml" ] || [ ! -d "src" ]; then
-    echo "ERROR: run sv_setup.sh from the asmo project root."
-    exit 1
-fi
+print_info() {
+    printf '[INFO] %s\n' "$1"
+}
 
-if [ ! -x "$BIN" ]; then
-    echo "ERROR: $BIN not found. Install binary first:"
-    echo "  cp target/release/asmo \$PREFIX/bin/asmo"
-    exit 1
-fi
+print_warn() {
+    printf '[WARN] %s\n' "$1"
+}
 
-if ! command -v sv >/dev/null 2>&1; then
-    echo "termux-services missing, installing..."
+print_error() {
+    printf '[ERROR] %s\n' "$1" >&2
+}
+
+require_asmo_binary() {
+    if ! command -v asmo >/dev/null 2>&1; then
+        print_error "'asmo' is not available in PATH."
+        print_error "Install the binary first, then rerun this script."
+        exit 1
+    fi
+}
+
+ensure_termux_services() {
+    if command -v sv >/dev/null 2>&1; then
+        return
+    fi
+
+    print_header "Installing termux-services"
     pkg install -y termux-services
-    echo "Close and reopen Termux, then run sv_setup.sh again."
+    print_warn "termux-services was installed. Restart Termux, then run this script again."
     exit 0
-fi
+}
 
-if ! rish -c 'true' >/dev/null 2>&1; then
-    echo "ERROR: rish/Shizuku not active."
-    echo "asmo will not start without rish."
+require_rish() {
+    if command -v rish >/dev/null 2>&1; then
+        return
+    fi
+
+    print_error "'rish' is not available in PATH."
+    print_error "Install or expose rish first, then rerun this script."
     exit 1
-fi
+}
 
-# Ensure runsvdir exists for this shell session when possible.
-if ! pgrep -x runsvdir >/dev/null 2>&1; then
+ensure_runsvdir() {
+    if pgrep -x runsvdir >/dev/null 2>&1; then
+        return
+    fi
+
     if [ -f "$PREFIX/etc/profile.d/start-services.sh" ]; then
-        . "$PREFIX/etc/profile.d/start-services.sh" || true
+        print_info "Starting runsvdir for this session."
+        . "$PREFIX/etc/profile.d/start-services.sh"
         sleep 1
     fi
-fi
+}
 
-# Clean stale registration/state.
-sv down asmo >/dev/null 2>&1 || true
-rm -f "$SERVICE_LINK"
-rm -rf "$SV_DIR"
-mkdir -p "$SV_DIR/log"
-mkdir -p "$LOG_DIR"
-mkdir -p "$PREFIX/var/service"
-
-cat > "$SV_DIR/run" << EOF
-#!/data/data/com.termux/files/usr/bin/sh
-exec 2>&1
-exec script -q -c "$BIN" /dev/null
-EOF
-
-cat > "$SV_DIR/log/run" << EOF
-#!/data/data/com.termux/files/usr/bin/sh
-exec svlogd -tt $LOG_DIR
-EOF
-
-chmod +x "$SV_DIR/run" "$SV_DIR/log/run"
-
-# Single activation mechanism: symlink only.
-ln -snf "$SV_DIR" "$SERVICE_LINK"
-
-echo "waiting for runit..."
-i=0
-while [ $i -lt 10 ]; do
-    if [ -S "$SV_DIR/supervise/ok" ]; then
-        sv up asmo >/dev/null 2>&1 || true
-        status="$(sv status asmo 2>&1 || true)"
-        case "$status" in
-            run:*)
-                echo "Service setup complete."
-                echo "Status:"
-                sv status asmo || true
-                echo ""
-                echo "Logs: tail -f $LOG_DIR/current"
-                exit 0
-                ;;
-        esac
+remove_existing_service() {
+    if [ -L "$SERVICE_LINK" ] || [ -d "$SV_DIR" ] || [ -d "$LOG_DIR" ]; then
+        print_header "Removing existing service"
+        sv down "$SERVICE_NAME" >/dev/null 2>&1 || true
+        rm -rf "$SERVICE_LINK"
+        rm -rf "$SV_DIR"
+        rm -rf "$LOG_DIR"
+        print_info "Previous service registration removed."
     fi
-    i=$((i + 1))
-    sleep 1
-done
+}
 
-echo "ERROR: runit did not register/start asmo in time."
-echo "Debug checks:"
-echo "  sv status asmo"
-echo "  ps -ef | grep runsvdir"
-echo "  ps -ef | grep runsv"
-echo "  ls -l $PREFIX/var/service"
-echo "  ls -la $SV_DIR"
-echo "  tail -50 $LOG_DIR/current"
-exit 1
+create_service_files() {
+    print_header "Creating service"
+    mkdir -p "$LOG_SERVICE_DIR"
+    mkdir -p "$LOG_DIR"
+    mkdir -p "$PREFIX/var/service"
+
+    cat > "$SV_DIR/run" << 'EOF'
+#!/data/data/com.termux/files/usr/bin/sh
+exec script -q -c "asmo" /dev/null 2>&1
+EOF
+
+    cat > "$LOG_SERVICE_DIR/run" << 'EOF'
+#!/data/data/com.termux/files/usr/bin/sh
+exec svlogd -tt /data/data/com.termux/files/usr/var/log/asmo
+EOF
+
+    chmod +x "$SV_DIR/run"
+    chmod +x "$LOG_SERVICE_DIR/run"
+    print_info "Service files written under $SV_DIR."
+}
+
+enable_service() {
+    print_header "Enabling service"
+    ln -snf "$SV_DIR" "$SERVICE_LINK"
+    ensure_runsvdir
+}
+
+verify_service() {
+    print_header "Verifying service"
+
+    attempts=0
+    while [ "$attempts" -lt 10 ]; do
+        if [ -S "$SV_DIR/supervise/ok" ]; then
+            status="$(sv status "$SERVICE_NAME" 2>&1 || true)"
+            case "$status" in
+                run:*)
+                    print_info "Service is running."
+                    printf '%s\n' "$status"
+                    print_info "Logs: tail -f $LOG_DIR/current"
+                    return
+                    ;;
+            esac
+        fi
+
+        attempts=$((attempts + 1))
+        sleep 1
+    done
+
+    print_error "Service did not come up in time."
+    print_error "Check: sv status $SERVICE_NAME"
+    print_error "Check: tail -50 $LOG_DIR/current"
+    exit 1
+}
+
+print_header "Asmo Service Setup"
+ensure_termux_services
+require_rish
+require_asmo_binary
+remove_existing_service
+create_service_files
+enable_service
+verify_service
